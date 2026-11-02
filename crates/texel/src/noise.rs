@@ -42,7 +42,7 @@ pub fn value(p: [f32; 3], seed: u32) -> f32 {
     let (iy, fy) = cell(p[1]);
     let (iz, fz) = cell(p[2]);
     let (sx, sy, sz) = (smooth(fx), smooth(fy), smooth(fz));
-    let h = |dx: i32, dy: i32, dz: i32| hash01(ix + dx, iy + dy, iz + dz, seed);
+    let h = |dx: i32, dy: i32, dz: i32| hash01(ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz), seed);
     lerp(
         lerp(lerp(h(0, 0, 0), h(1, 0, 0), sx), lerp(h(0, 1, 0), h(1, 1, 0), sx), sy),
         lerp(lerp(h(0, 0, 1), h(1, 0, 1), sx), lerp(h(0, 1, 1), h(1, 1, 1), sx), sy),
@@ -75,7 +75,8 @@ pub fn perlin(p: [f32; 3], seed: u32) -> f32 {
     let (iy, fy) = cell(p[1]);
     let (iz, fz) = cell(p[2]);
     let (sx, sy, sz) = (smooth(fx), smooth(fy), smooth(fz));
-    let g = |dx: i32, dy: i32, dz: i32| grad(ix + dx, iy + dy, iz + dz, seed, [fx - dx as f32, fy - dy as f32, fz - dz as f32]);
+    let g =
+        |dx: i32, dy: i32, dz: i32| grad(ix.wrapping_add(dx), iy.wrapping_add(dy), iz.wrapping_add(dz), seed, [fx - dx as f32, fy - dy as f32, fz - dz as f32]);
     let v = lerp(
         lerp(lerp(g(0, 0, 0), g(1, 0, 0), sx), lerp(g(0, 1, 0), g(1, 1, 0), sx), sy),
         lerp(lerp(g(0, 0, 1), g(1, 0, 1), sx), lerp(g(0, 1, 1), g(1, 1, 1), sx), sy),
@@ -99,7 +100,7 @@ pub fn cellular(p: [f32; 3], seed: u32) -> (f32, f32, f32) {
     for dz in -1..=1 {
         for dy in -1..=1 {
             for dx in -1..=1 {
-                let h = pcg3d((ix + dx) as u32 ^ seed.wrapping_mul(0xC2B2_AE35), (iy + dy) as u32, (iz + dz) as u32);
+                let h = pcg3d(ix.wrapping_add(dx) as u32 ^ seed.wrapping_mul(0xC2B2_AE35), iy.wrapping_add(dy) as u32, iz.wrapping_add(dz) as u32);
                 let o = h.map(|v| v as f32 / u32::MAX as f32);
                 let d = [dx as f32 + o[0] - fx, dy as f32 + o[1] - fy, dz as f32 + o[2] - fz];
                 let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
@@ -162,5 +163,17 @@ mod tests {
         let a = value([0.5, 0.5, 0.5], 0);
         let b = value([0.5001, 0.5, 0.5], 0);
         assert!((a - b).abs() < 1e-2);
+    }
+
+    #[test]
+    fn far_away_points_do_not_overflow_the_lattice() {
+        for v in [1e10_f32, -1e10, f32::MAX, f32::MIN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let p = [v, v, v];
+            for f in [value, perlin, worley] {
+                let _ = f(p, 3);
+            }
+            let _ = cellular(p, 3);
+            let _ = fbm(p, 6, 1, perlin);
+        }
     }
 }
