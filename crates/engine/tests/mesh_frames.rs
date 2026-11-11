@@ -172,6 +172,24 @@ fn the_mesh_follows_the_chosen_frame_and_keeps_its_paint() {
 }
 
 #[test]
+fn a_frame_change_finishes_a_box_fill_first() {
+    let mut s = session(&[triangle(0.0), triangle(1.0), triangle(2.0)]);
+    execute(&mut s, "tool.polygonFill", &json!({})).unwrap();
+    s.update();
+    let history = s.history_labels().len();
+    assert!(
+        s.drag_polygon_fill_box_uv(texturecraft_engine::geom::glam::Vec2::ZERO, texturecraft_engine::geom::glam::Vec2::ONE).unwrap() > 0,
+        "the box fills the triangle"
+    );
+    assert_eq!(s.history_labels().len(), history, "a drag in progress is not a step yet");
+
+    execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap();
+    assert_eq!(s.history_labels().len(), history + 1, "the frame change finished the drag as one step");
+    assert_eq!(s.history_labels().last().map(String::as_str), Some("Polygon fill"));
+    assert_eq!(s.end_polygon_fill_box(), 0, "no drag is left open on the new shape");
+}
+
+#[test]
 fn the_frame_is_saved_with_the_project_and_kept_by_reimport() {
     let mut s = session(&[triangle(0.0), triangle(1.0), triangle(2.0)]);
     execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap();

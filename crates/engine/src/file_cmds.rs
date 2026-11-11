@@ -540,6 +540,9 @@ impl Session {
                 ),
             ));
         }
+        // A box fill under way was measured on the old shape: finish it as its own step first, as
+        // undo and tool changes do, so its next update doesn't use stale positions or depth.
+        self.end_polygon_fill_box();
         self.replace_mesh(mesh)?;
         self.mesh_frame = frame;
         self.modified = true;
