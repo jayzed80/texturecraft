@@ -165,6 +165,31 @@ fn escape_cancels_the_pick_without_editing_colors() {
 }
 
 #[test]
+fn escape_cancels_id_picking_with_a_hidden_rail_popup() {
+    let (mut harness, effect) = app_with_color_selection(true);
+    harness.get_by_label(&pick_color_label()).click();
+    harness.run_steps(3);
+    let context = harness.ctx.clone();
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.view.log");
+    harness.run_steps(3);
+    harness.get_by_role_and_label(egui::Role::Button, "Close");
+    harness.key_press(egui::Key::Tab);
+    harness.run_steps(3);
+    assert!(harness.state().ui.hide_ui);
+    assert!(harness.query_by_role_and_label(egui::Role::Button, "Close").is_none());
+    assert!(harness.state().picking_id_color.is_some());
+    let history = harness.state().session.history_labels();
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+
+    assert!(harness.state().picking_id_color.is_none(), "one Escape cancels ID picking despite the hidden popup");
+    assert_eq!(harness.state().session.view, ViewMode::Material);
+    assert_eq!(colors(&harness, effect), vec![FIRST, SECOND, THIRD]);
+    assert_eq!(harness.state().session.history_labels(), history);
+}
+
+#[test]
 fn picking_from_the_popup_closes_it_before_the_viewport_click() {
     use texturecraft_ui_egui::properties_popup::{self, PropertiesPopup};
 
@@ -247,8 +272,11 @@ fn color_selection_snapshots_and_quick_mask_pick() {
     let center = harness.state().viewport_rect.center();
     harness.hover_at(center + egui::vec2(80.0, 0.0));
     let expected = save(&mut harness, "color-selection-picking");
+
+    execute(&mut harness.state_mut().session, "viewport.quickMask", &json!({"enabled": true})).unwrap();
     execute(&mut harness.state_mut().session, "viewport.quickMask.edit", &json!({"editing": true})).unwrap();
     let with_quick_mask = save(&mut harness, "color-selection-picking-quick-mask");
+
     assert_eq!(
         with_quick_mask.get_pixel(center.x as u32, center.y as u32),
         expected.get_pixel(center.x as u32, center.y as u32),
@@ -256,14 +284,18 @@ fn color_selection_snapshots_and_quick_mask_pick() {
     );
 
     click_at(&mut harness, center);
+
     assert!(harness.state().session.quick_mask.editing, "picking preserves quick-mask editing");
     save(&mut harness, "color-selection-quick-mask-restored");
+
     execute(&mut harness.state_mut().session, "viewport.quickMask.edit", &json!({"editing": false})).unwrap();
     harness.state_mut().ui.layout = texturecraft_ui_egui::state::ViewLayout::Only2D;
     harness.get_by_label(&pick_color_label()).click();
     save(&mut harness, "color-selection-picking-2d");
     click_at(&mut harness, center);
+
     assert!(harness.state().picking_id_color.is_none());
+
     execute(&mut harness.state_mut().session, "textureSet.meshMap.clear", &json!({"map": "id"})).unwrap();
     save(&mut harness, "color-selection-no-id-map");
 }

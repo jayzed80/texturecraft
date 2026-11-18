@@ -1,10 +1,12 @@
 //! Files: projects (`.tcraft`), mesh import, texture export. Byte-based functions work on the
 //! web; path-based commands are native only.
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 #[cfg(not(target_arch = "wasm32"))]
-use texturecraft_core::PROJECT_EXT;
-use texturecraft_core::{NormalFormat, Project, TextureSet};
+use texturecraft_core::{NormalFormat, PROJECT_EXT};
+use texturecraft_core::{Project, TextureSet};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, Padding, ProjectFile};
 use texturecraft_geom::{Mesh, primitives};
 
@@ -19,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New project from a mesh file",
             [],
             None,
-            "{mesh: path to .glb/.gltf/.fbx/.dae/.usd/.usda/.usdc/.usdz/.abc/.obj/.ply/.stl, resolution?: 2048, name?, uvTiles?: bool (UDIM; default: when the UVs leave tile 1001), template?: project template name}",
+            "{mesh: path to .glb/.gltf/.fbx/.dae/.usd/.usda/.usdc/.usdz/.abc/.obj/.ply/.stl, resolution?: 2048, name?, uvTiles?: bool (UDIM; default: when the UVs leave tile 1001), template?: project template name, importCameras?: bool (default true: keep the cameras stored in the file)}",
             always,
             new_from_mesh
         ),
@@ -38,11 +40,20 @@ pub fn specs() -> Vec<CommandSpec> {
             reimport
         ),
         cmd!(
+            "file.changeMesh",
+            "Change mesh",
+            [],
+            None,
+            "{path: the new mesh file, preserveStrokes?: bool (painted pixels follow the surface where the UVs differ; default true)} → {preserved?: texels re-projected}. Keeps layers, texture sets and settings; texture sets map to the new mesh by material index",
+            always,
+            change_mesh
+        ),
+        cmd!(
             "file.exportTextures",
             "Export textures",
             ["File"],
             None,
-            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|\"all\", format?: png|jpg|tga|tif|exr|..., bitDepth?, padding?: none|dilation|dilationDefault|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP and HDR can't hold one and warn), materialX?: bool (also write a .mtlx OpenPBR material per texture set; needs the \"OpenPBR (separate maps)\" preset)}",
+            "{dir, preset?: built-in or user preset name, or a preset object {name, maps}, ts?: index|[indexes]|\"all\", format?: png|jpg|tga|tif|exr|..., bitDepth?, padding?: none|dilation|dilationDefault|infinite, dilation?: px, size?: px, normalFormat?: openGl|directX, colorSpace?: sRGB (default for 8/16-bit files)|Linear Rec.709 (default for exr, hdr)|ACEScg|ACES2065-1 (colour maps are converted, data maps never are; 8/16-bit files clamp to 0-1; a chosen space is also recorded in the colour maps: an ICC profile in PNG, JPEG, TIFF and WebP, the chromaticities in EXR; TGA, BMP and HDR can't hold one and warn), materialX?: bool (also write a .mtlx OpenPBR material per texture set; needs the \"OpenPBR (separate maps)\" preset)}",
             always,
             export_textures
         ),
@@ -131,6 +142,7 @@ impl Session {
     /// for UV-tiled sets, or nothing for them without `tiled`).
     fn material_files(&mut self, opts: ExportOptions, tiled: bool, materials: usize) -> Result<Vec<Vec<ExportedFile>>> {
         let opts = ExportOptions { atlas: true, ..opts };
+
         (0..materials)
             .map(|m| match self.texture_set_of_material(m) {
                 Some(ts) if tiled || self.doc.project.texture_sets.get(ts).is_some_and(|t| t.tile_grid().is_none()) => self.export_files(&[ts], &opts),
@@ -146,20 +158,31 @@ impl Session {
 
     /// [`Session::from_mesh_bytes`] with a UV tile mode (see [`Session::new_project_tiled`]).
     pub fn from_mesh_bytes_tiled(file_name: &str, bytes: &[u8], resolution: u32, name: &str, uv_tiles: Option<bool>) -> Result<Session> {
-        let imported = texturecraft_formats::import_mesh_bytes(file_name, bytes).map_err(fe)?;
-        let ext = ext_of(file_name);
-        let mut s = Session::new_project_tiled(name, imported.mesh, &format!("mesh.{ext}"), Some((ext, bytes.to_vec())), resolution, uv_tiles)?;
-        s.doc.project.mesh_file = leaf_of(file_name);
-        s.doc.project.cameras = imported.cameras;
-        s.log.extend(imported.report.warnings.iter().cloned());
-        s.log.push(format!(
+        Self::from_mesh_source(file_name, Cow::Borrowed(bytes), resolution, name, uv_tiles)
+    }
+
+    fn from_mesh_source(file_name: &str, bytes: Cow<'_, [u8]>, resolution: u32, name: &str, uv_tiles: Option<bool>) -> Result<Session> {
+        let imported = texturecraft_formats::import_mesh_bytes(file_name, &bytes).map_err(fe)?;
+        let extension = ext_of(file_name);
+        let mut session = Session::new_project_tiled(name, imported.mesh, &format!("mesh.{extension}"), None, resolution, uv_tiles)?;
+
+        // Packed mesh files can have spare capacity that the project would otherwise retain
+        let mut source = bytes.into_owned();
+        source.shrink_to_fit();
+        session.mesh_source = Some((extension, source));
+        session.doc.project.mesh_file = leaf_of(file_name);
+        session.doc.project.cameras = imported.cameras;
+
+        session.log.extend(imported.report.warnings);
+        session.log.push(format!(
             "Imported {} ({} triangles, {} materials{})",
             file_name,
             imported.report.triangles,
             imported.report.materials,
             if imported.report.uvs_generated { ", UVs generated" } else { "" }
         ));
-        Ok(s)
+
+        Ok(session)
     }
 
     /// Open a `.tcraft` project from bytes.
@@ -227,17 +250,21 @@ impl Session {
 
     /// Render every export file for texture sets `sets` (in memory; works on the web).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
-        self.update();
+        if self.solo.is_none() {
+            self.update();
+        }
+
         let mesh_name = stem_of(self.doc.project.mesh.trim_start_matches("builtin:"));
         let mut out = Vec::new();
         let empty = Default::default();
         for &ts in sets {
             let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
+            let composite = self.document_composite(ts, &cache.covered_tiles).ok_or_else(|| EngineError::Other(format!("no texture set {ts}")))?;
             let coverage = cache.gbuf.coverage_mask();
             let input = ExportInput {
                 project: &self.doc.project,
                 ts,
-                composite: &cache.composite,
+                composite: &composite,
                 baked: self.doc.baked.get(&ts).unwrap_or(&empty),
                 coverage: &coverage,
                 mesh_name: &mesh_name,
@@ -266,6 +293,7 @@ pub fn export_options(s: &Session, p: &Value, cmd: &str) -> Result<ExportOptions
         Some(v @ Value::Object(_)) => Some(crate::preset_cmds::preset_param(v, cmd)?),
         Some(_) => return Err(bad(cmd, "`preset` must be a preset name or a preset object")),
     };
+
     let preset = preset.ok_or_else(|| bad(cmd, format!("unknown export preset {}", p.get("preset").unwrap_or(&Value::Null))))?;
     let mut o = ExportOptions::new(preset);
     if let Some(f) = strp(p, "format") {
@@ -296,7 +324,8 @@ pub fn export_options(s: &Session, p: &Value, cmd: &str) -> Result<ExportOptions
                     .ok_or_else(|| bad(cmd, format!("unknown colorSpace `{name}` (sRGB, Linear Rec.709, ACEScg or ACES2065-1)")))?,
             );
         }
-        // A value of the wrong type is an error, not the format's default space.
+
+        // A value of the wrong type is an error, not the format's default space
         Some(other) => return Err(bad(cmd, format!("`colorSpace` is a name (sRGB, Linear Rec.709, ACEScg or ACES2065-1), not {other}"))),
     }
     Ok(o)
@@ -306,8 +335,22 @@ fn sets_param(s: &Session, p: &Value, cmd: &str) -> Result<Vec<usize>> {
     match p.get("ts") {
         None => Ok((0..s.set_count()).collect()),
         Some(Value::String(a)) if a == "all" => Ok((0..s.set_count()).collect()),
-        Some(v) => Ok(vec![v.as_u64().map(|t| t as usize).filter(|t| *t < s.set_count()).ok_or_else(|| bad(cmd, "invalid `ts`"))?]),
+
+        // Several sets in one command, so a file name two of them share is found before anything is written
+        Some(Value::Array(a)) => {
+            let mut sets = a.iter().map(|v| set_index(s, v, cmd)).collect::<Result<Vec<_>>>()?;
+
+            // A set listed twice is written once
+            let mut seen = std::collections::HashSet::new();
+            sets.retain(|t| seen.insert(*t));
+            Ok(sets)
+        }
+        Some(v) => Ok(vec![set_index(s, v, cmd)?]),
     }
+}
+
+fn set_index(s: &Session, v: &Value, cmd: &str) -> Result<usize> {
+    v.as_u64().and_then(|index| usize::try_from(index).ok()).filter(|index| *index < s.set_count()).ok_or_else(|| bad(cmd, "invalid `ts`"))
 }
 
 fn plan(s: &mut Session, p: &Value) -> Result<Value> {
@@ -375,23 +418,32 @@ mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{absolute, open_path, read_mesh};
 
-/// `file.new {mesh, name?, resolution?, uvTiles?, template?}`: a new project from the mesh file `mesh`,
-/// remembering its path for Reimport mesh.
+/// `file.new {mesh, name?, resolution?, uvTiles?, template?, importCameras?}`: a new project from the
+/// mesh file `mesh`, remembering its path for Reimport mesh.
 #[cfg(not(target_arch = "wasm32"))]
-fn new_from_mesh(s: &mut Session, p: &Value) -> Result<Value> {
-    let path = native::path_param(p, "mesh", "file.new")?;
-    let f = native::read_mesh("file.new", path)?;
-    let template = crate::template_cmds::template_param(s, p, "file.new")?;
-    let res = u64p(p, "resolution").or(template.as_ref().map(|t| u64::from(t.resolution))).unwrap_or(2048);
-    let name = strp(p, "name").map(str::to_string).unwrap_or_else(|| stem_of(path));
-    let mut next = Session::from_mesh_bytes_tiled(&f.name, &f.bytes, u32::try_from(res).unwrap_or(0), &name, crate::commands::boolp(p, "uvTiles"))?;
+fn new_from_mesh(session: &mut Session, params: &Value) -> Result<Value> {
+    const DEFAULT_RESOLUTION_PX: u64 = 2048;
+
+    let path = native::path_param(params, "mesh", "file.new")?;
+    let template = crate::template_cmds::template_param(session, params, "file.new")?;
+    let resolution = u64p(params, "resolution").or(template.as_ref().map(|template| u64::from(template.resolution))).unwrap_or(DEFAULT_RESOLUTION_PX);
+    let name = strp(params, "name").map(str::to_string).unwrap_or_else(|| stem_of(path));
+    let uv_tiles = crate::commands::boolp(params, "uvTiles");
+    let mesh_file = native::read_mesh("file.new", path)?;
+
+    let mut next = Session::from_mesh_source(&mesh_file.name, Cow::Owned(mesh_file.bytes), u32::try_from(resolution).unwrap_or(0), &name, uv_tiles)?;
     next.doc.project.mesh_path = native::absolute(path);
-    next.log.extend(f.warnings);
-    if let Some(t) = &template {
-        next.apply_template(t);
+    next.log.extend(mesh_file.warnings);
+    if crate::commands::boolp(params, "importCameras") == Some(false) {
+        next.doc.project.cameras.clear();
     }
-    s.switch_to(next);
-    Ok(crate::inspect::session(s))
+    if let Some(template) = &template {
+        next.apply_template(template);
+    }
+
+    session.switch_to(next);
+
+    Ok(crate::inspect::session(session))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -439,6 +491,16 @@ fn reimport(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn change_mesh(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = native::path_param(p, "path", "file.changeMesh")?;
+    let file = native::read_mesh("file.changeMesh", path)?;
+    let reply = s.reimport_mesh(Some(file), crate::commands::boolp(p, "preserveStrokes").unwrap_or(true))?;
+    // Only after the swap succeeded: Reimport mesh and Save keep following the new file.
+    s.doc.project.mesh_path = native::absolute(path);
+    Ok(reply)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Session {
     /// The file the mesh was imported from, when it is still there: what Reimport mesh reads again.
     pub fn remembered_mesh_path(&self) -> Option<&str> {
@@ -471,6 +533,19 @@ impl Session {
         let mut next = Session::new(doc, mesh, source)?;
         next.log.extend(warnings);
         next.path = self.path.clone();
+        next.sync_images();
+        // The high polys and the skew map stay. The cage is sampled by triangle index and
+        // barycentrics, so it stays only for an identical mesh; the low poly's base colours are
+        // read again from the new mesh.
+        next.bake_meshes = self.bake_meshes.clone();
+        next.bake_meshes.low_base_color = Default::default();
+        if next.bake_meshes.cage.is_some() && *next.mesh != *self.mesh {
+            next.bake_meshes.cage = None;
+            next.log.push("the cage mesh was dropped: the low-poly mesh changed".into());
+        }
+        if self.doc.bake_paint.keys().any(|(_, target)| *target == texturecraft_core::BakePaintTarget::Skew) && self.source.uvs != next.source.uvs {
+            next.log.push("the skew map is laid over the old UV layout; check it in Bake mode".into());
+        }
         next.modified = true;
         next.project_id = self.project_id;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
@@ -514,7 +589,8 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
         let mut textures: Vec<Texture> = Vec::new();
         for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, opts).map_err(fe)? {
             let Some(input) = opts.preset.maps.get(f.map).and_then(|m| materialx::input_of_template(&m.file)) else { continue };
-            // The first tile stands for all of them: its number is written as <UDIM>.
+
+            // The first tile stands for all of them: its number is written as <UDIM>
             let file = f.udim_name.clone().unwrap_or_else(|| f.name.clone());
             let colorspace = materialx::colorspace_name(opts.space_for(f.format));
             if !textures.iter().any(|t| t.input == input) {
@@ -526,8 +602,10 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
             warnings.push(format!("MaterialX: texture set \"{}\" has no OpenPBR maps; use the \"OpenPBR (separate maps)\" preset", set.name));
             continue;
         }
+
         let stem = texturecraft_formats::export::sanitize_file_stem(&format!("{mesh_name}_{}", set.name));
-        // Case-insensitive: Windows and macOS file systems are.
+
+        // Case-insensitive: Windows and macOS file systems are
         if !stems.insert(stem.to_ascii_lowercase()) {
             warnings.push(format!(
                 "MaterialX: texture set \"{}\" exports as \"{stem}\" like an earlier set, so its .mtlx was not written; rename one of them",
@@ -539,7 +617,8 @@ fn write_materialx(s: &Session, sets: &[usize], opts: &ExportOptions, dir: &std:
         texturecraft_formats::write_atomic(&path, materialx::write(&format!("{mesh_name}_{}", set.name), &textures, None).as_bytes()).map_err(fe)?;
         out.push(path);
     }
-    // The normalmap node only exists in a material that has a normal map.
+
+    // The normalmap node only exists in a material that has a normal map
     if normal_map_written && opts.normal_format == Some(NormalFormat::DirectX) {
         warnings.push("MaterialX: the normalmap node reads OpenGL (+Y) normals; this export wrote DirectX normals, so flip the green channel".into());
     }
@@ -621,19 +700,49 @@ use unsupported as save_copy;
 #[cfg(target_arch = "wasm32")]
 use unsupported as reimport;
 #[cfg(target_arch = "wasm32")]
+use unsupported as change_mesh;
+#[cfg(target_arch = "wasm32")]
 use unsupported as export_textures;
 #[cfg(target_arch = "wasm32")]
 use unsupported as export_mesh;
 
 fn close(s: &mut Session, _: &Value) -> Result<Value> {
-    let next = Session::new_project("Untitled", primitives::material_ball(), "builtin:material_ball", None, 2048)?;
-    s.switch_to(next);
+    s.switch_to(Session::closed()?);
     Ok(Value::Null)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// `file.new` keeps the cameras stored in the mesh file unless `importCameras` is false.
+    #[test]
+    fn new_from_mesh_imports_cameras_unless_told_not_to() {
+        let dir = std::env::temp_dir().join(format!("tc_new_cameras_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shot.gltf");
+        let gltf = json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"byteLength": 36, "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA"}],
+            "bufferViews": [{"buffer": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "cameras": [{"name": "Shot", "type": "perspective", "perspective": {"yfov": 0.8, "znear": 0.1}}],
+            "nodes": [{"mesh": 0}, {"camera": 0, "translation": [0.5, 0.5, 4.0]}],
+            "scenes": [{"nodes": [0, 1]}],
+            "scene": 0
+        });
+        std::fs::write(&file, serde_json::to_vec(&gltf).unwrap()).unwrap();
+        let path = file.display().to_string();
+        let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+
+        crate::execute(&mut s, "file.new", &json!({"mesh": path, "resolution": 128})).unwrap();
+        assert_eq!(s.doc.project.cameras.len(), 1, "the file's camera comes along by default");
+
+        crate::execute(&mut s, "file.new", &json!({"mesh": path, "resolution": 128, "importCameras": false})).unwrap();
+        assert!(s.doc.project.cameras.is_empty(), "importCameras false leaves the cameras out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Reimport mesh reads the mesh file again from where it was imported, so a change saved to
     /// the file since shows up (it used to re-read the project's own copy and change nothing).
@@ -764,6 +873,82 @@ f 1/1 2/2 3/3
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A project built on one mesh moves to another mesh file with its layers intact, even when
+    /// it carries its own copy of the mesh (a plain reimport would only re-read that copy).
+    #[test]
+    fn change_mesh_swaps_the_mesh_and_keeps_the_layers() {
+        let dir = std::env::temp_dir().join(format!("tc_change_mesh_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let quad = dir.join("quad.obj");
+        std::fs::write(&quad, "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nf 1/1 2/2 3/3 4/4\n").unwrap();
+        let tri = dir.join("tri.obj");
+        std::fs::write(&tri, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
+        let mut s = Session::from_mesh_bytes("quad.obj", &std::fs::read(&quad).unwrap(), 128, "quad").unwrap();
+        crate::execute(&mut s, "layer.add.fill", &json!({"color": [1.0, 0.0, 0.0]})).unwrap();
+        let layers = s.doc.project.layers.len();
+        assert!(crate::execute(&mut s, "file.changeMesh", &json!({})).is_err(), "a path is required");
+        crate::execute(&mut s, "file.changeMesh", &json!({"path": tri.display().to_string()})).unwrap();
+        assert_eq!(s.mesh.triangle_count(), 1, "the new mesh is in use");
+        assert_eq!(s.doc.project.mesh_file, "tri.obj");
+        assert_eq!(s.doc.project.layers.len(), layers, "the layers stay");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Open A, change to B, edit B on disk: Reimport mesh (also after save and reopen) must read B,
+    /// not A. A failed change leaves the remembered path alone.
+    #[test]
+    fn change_mesh_remembers_the_new_file_for_reimport() {
+        let dir = std::env::temp_dir().join(format!("tc_change_mesh_path_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = |x: f32| format!("v 0 0 0\nv {x} 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n");
+        let (a, b) = (dir.join("a.obj"), dir.join("b.obj"));
+        std::fs::write(&a, obj(1.0)).unwrap();
+        std::fs::write(&b, obj(2.0)).unwrap();
+        let width = |s: &Session| s.mesh.positions.iter().map(|p| p.x).fold(0.0_f32, f32::max);
+        let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        crate::execute(&mut s, "file.new", &json!({"mesh": a.display().to_string(), "resolution": 128})).unwrap();
+        let a_abs = s.remembered_mesh_path().map(str::to_string).unwrap();
+        // A failed change (unreadable file) keeps A.
+        let missing = dir.join("missing.obj");
+        assert!(crate::execute(&mut s, "file.changeMesh", &json!({"path": missing.display().to_string()})).is_err());
+        assert_eq!(s.remembered_mesh_path(), Some(a_abs.as_str()));
+        crate::execute(&mut s, "file.changeMesh", &json!({"path": b.display().to_string()})).unwrap();
+        assert_eq!(width(&s), 2.0);
+        let b_abs = s.remembered_mesh_path().map(str::to_string).expect("B is remembered");
+        assert_ne!(a_abs, b_abs);
+        // The remembered path survives save and reopen.
+        let mut reopened = Session::from_project_bytes(&s.to_project_bytes().unwrap()).unwrap();
+        assert_eq!(reopened.remembered_mesh_path(), Some(b_abs.as_str()));
+        // Edit B, then Reimport from the remembered path: B's edits arrive, not A.
+        std::fs::write(&b, obj(3.0)).unwrap();
+        let remembered = reopened.remembered_mesh_path().map(str::to_string).unwrap();
+        crate::execute(&mut reopened, "file.reimportMesh", &json!({"path": remembered})).unwrap();
+        assert_eq!(width(&reopened), 3.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn change_mesh_resets_base_colours_and_drops_a_cage_of_another_mesh() {
+        let dir = std::env::temp_dir().join(format!("tc_change_mesh_cage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.obj");
+        std::fs::write(&a, "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
+        // Same triangle count, other vertices.
+        let b = dir.join("b.obj");
+        std::fs::write(&b, "v 0 0 0\nv 2 0 0\nv 0 2 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n").unwrap();
+        let mut s = Session::from_mesh_bytes("a.obj", &std::fs::read(&a).unwrap(), 128, "a").unwrap();
+        let cage = crate::bake::BakeMesh { name: "cage".into(), bytes: Default::default(), mesh: s.mesh.clone(), base_color: Vec::new() };
+        s.bake_meshes.cage = Some(cage);
+        let _ = s.bake_meshes.low_base_color.set(Err("old".into()));
+        // The same mesh again keeps the cage but not the cached colours.
+        crate::execute(&mut s, "file.changeMesh", &json!({"path": a.display().to_string()})).unwrap();
+        assert!(s.bake_meshes.cage.is_some());
+        assert!(s.bake_meshes.low_base_color.get().is_none(), "the colours are read again");
+        crate::execute(&mut s, "file.changeMesh", &json!({"path": b.display().to_string()})).unwrap();
+        assert!(s.bake_meshes.cage.is_none(), "the cage was made for another mesh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn unnamed_parts_keep_their_names_and_masks_through_save_and_reopen() {
         // A GLB quad whose mesh and node have no name: its one part is named after the file.
@@ -807,5 +992,19 @@ f 1/1 2/2 3/3
         old.project.mesh_file.clear();
         let mut old = Session::from_project_bytes(&texturecraft_formats::save_project_bytes(&old).unwrap()).unwrap();
         assert_eq!(parts(&mut old), json!(["mesh"]));
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "32"))]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn export_rejects_an_index_that_would_wrap_to_the_first_set() {
+        let mut session = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 128).unwrap();
+        let wrapped_index = u64::from(u32::MAX) + 1;
+
+        assert!(crate::execute(&mut session, "export.plan", &json!({ "ts": wrapped_index })).is_err());
+        assert!(crate::execute(&mut session, "export.plan", &json!({ "ts": [wrapped_index] })).is_err());
     }
 }

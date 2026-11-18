@@ -2,7 +2,7 @@
 //! world-space [`Mesh`] with one submesh per material and part (glTF node, OBJ object, FBX
 //! model, COLLADA node, USD Mesh prim, Alembic PolyMesh; unnamed parts take the file stem), materials contiguous,
 //! glTF UV convention (origin top-left, v down),
-//! normals (computed when missing), vertex colors (glTF, OBJ, PLY), UVs (auto-unwrapped when
+//! normals (computed when missing), vertex colors (glTF, FBX, OBJ, PLY), UVs (auto-unwrapped when
 //! missing) and MikkTSpace tangents. glTF, FBX, COLLADA and USD cameras come along as the
 //! project's camera list.
 
@@ -130,6 +130,9 @@ pub(crate) struct RawMesh {
     pub colors: Option<Vec<Vec4>>,
     /// Triangles (vertex indices) per (material, part name); an empty part is unnamed.
     pub groups: Vec<(String, String, Vec<u32>)>,
+    // Build-time index; group names are restored only after polygon collection ends
+    // Nested maps allow borrowed lookups without allocating keys for every polygon
+    group_index: HashMap<String, HashMap<String, usize>>,
     pub warnings: Vec<String>,
     pub cameras: Vec<RawCamera>,
     /// Materials whose base color is not plain white (glTF).
@@ -148,11 +151,13 @@ pub(crate) struct RawBaseColor {
 impl RawMesh {
     /// Triangle list of `material` in `part`, created on first use.
     pub fn group(&mut self, material: &str, part: &str) -> &mut Vec<u32> {
-        let i = match self.groups.iter().position(|(m, p, _)| m == material && p == part) {
+        let i = match self.group_index.get(material).and_then(|parts| parts.get(part)).copied() {
             Some(i) => i,
             None => {
-                self.groups.push((material.to_string(), part.to_string(), Vec::new()));
-                self.groups.len() - 1
+                let i = self.groups.len();
+                self.groups.push((material.to_owned(), part.to_owned(), Vec::new()));
+                self.group_index.entry(material.to_owned()).or_default().insert(part.to_owned(), i);
+                i
             }
         };
         &mut self.groups[i].2
@@ -182,10 +187,11 @@ pub(crate) struct Corner {
     pub p: Vec3,
     pub n: Option<Vec3>,
     pub uv: Option<Vec2>,
+    pub color: Option<Vec4>,
 }
 
 /// Collects polygons into a [`RawMesh`]: fan triangulation, one vertex per unique corner, and
-/// normals / UVs kept only when every corner has them (else computed / unwrapped).
+/// normals / UVs / colors kept only when every corner has them (else computed / unwrapped / white).
 #[derive(Default)]
 pub(crate) struct PolygonSink {
     /// Part name of the polygons that follow.
@@ -193,10 +199,13 @@ pub(crate) struct PolygonSink {
     raw: RawMesh,
     normals: Vec<Vec3>,
     uvs: Vec<Vec2>,
+    /// Allocated by the first coloured corner, so a scene without colors pays nothing for them.
+    colors: Option<Vec<Vec4>>,
     missing_normals: bool,
     missing_uvs: bool,
     some_uvs: bool,
-    ids: HashMap<[u32; 8], u32>,
+    missing_colors: bool,
+    ids: HashMap<[u32; 12], u32>,
     polygon: Vec<u32>,
     triangles: usize,
 }
@@ -213,13 +222,24 @@ impl PolygonSink {
             self.missing_normals |= c.n.is_none();
             self.missing_uvs |= c.uv.is_none();
             self.some_uvs |= c.uv.is_some();
+            self.missing_colors |= c.color.is_none();
             let (n, uv) = (c.n.unwrap_or_default(), c.uv.unwrap_or_default());
+            // A corner without a color must not merge with one that has it.
+            let color_key = c.color.map_or([u32::MAX; 4], |v| v.to_array().map(f32::to_bits));
             let key = [c.p.x, c.p.y, c.p.z, n.x, n.y, n.z, uv.x, uv.y].map(f32::to_bits);
+            let key = [key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], color_key[0], color_key[1], color_key[2], color_key[3]];
             let id = match self.ids.entry(key) {
                 Entry::Occupied(e) => *e.get(),
                 Entry::Vacant(e) => {
                     let id = self.raw.positions.len();
                     check_vertices(id + 1)?;
+                    // White stands in for the corners before the first coloured one.
+                    if c.color.is_some() && self.colors.is_none() {
+                        self.colors = Some(vec![Vec4::ONE; id]);
+                    }
+                    if let Some(colors) = self.colors.as_mut() {
+                        colors.push(c.color.unwrap_or(Vec4::ONE));
+                    }
                     self.raw.positions.push(c.p);
                     self.normals.push(n);
                     self.uvs.push(uv);
@@ -242,8 +262,12 @@ impl PolygonSink {
         if self.missing_uvs && self.some_uvs {
             self.warn("some polygons have no UVs; the whole mesh was unwrapped automatically".into());
         }
+        if self.missing_colors && self.colors.is_some() {
+            self.warn("some polygon corners have no color in the color layer; vertex colors were dropped".into());
+        }
         self.raw.normals = (!self.missing_normals).then_some(self.normals);
         self.raw.uvs = (!self.missing_uvs).then_some(self.uvs);
+        self.raw.colors = if self.missing_colors { None } else { self.colors.take() };
         self.raw
     }
 }

@@ -133,34 +133,36 @@ fn split(axis: SplitAxis, size: SplitSize, first: Node<Panel>, second: Node<Pane
     Node::Split { axis, size, first: Box::new(first), second: Box::new(second) }
 }
 
-/// The default: assets left of the viewport; texture set list, layers (tabbed with the texture
-/// set settings) and properties down the right. Ratios match the 1600x960 window. Display,
-/// shader, history and log are closed and open as floating windows.
+/// The default: assets (4 tile columns at 1920 px) left of the viewport, then texture sets, layers (tabbed with texture set settings) and properties
 pub fn default_workspace() -> Workspace {
     use Panel::*;
+
+    // The Assets split keeps four tiles visible at the reference window width
+    const ASSETS_SPLIT_RATIO: f32 = 0.16;
+    const VIEWPORT_SPLIT_RATIO: f32 = 0.80;
+    const TEXTURE_SET_SPLIT_RATIO: f32 = 0.125;
+    const LAYERS_SPLIT_RATIO: f32 = 0.57;
+
     let column = split(
         SplitAxis::Vertical,
-        SplitSize::Ratio(0.125),
+        SplitSize::Ratio(TEXTURE_SET_SPLIT_RATIO),
         tabs(&[TextureSetList]),
-        split(SplitAxis::Vertical, SplitSize::Ratio(0.57), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
+        split(SplitAxis::Vertical, SplitSize::Ratio(LAYERS_SPLIT_RATIO), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
     );
-    let root =
-        split(SplitAxis::Horizontal, SplitSize::Ratio(0.115), tabs(&[Assets]), split(SplitAxis::Horizontal, SplitSize::Ratio(0.78), tabs(&[Viewport]), column));
+    let root = split(
+        SplitAxis::Horizontal,
+        SplitSize::Ratio(ASSETS_SPLIT_RATIO),
+        tabs(&[Assets]),
+        split(SplitAxis::Horizontal, SplitSize::Ratio(VIEWPORT_SPLIT_RATIO), tabs(&[Viewport]), column),
+    );
     let mut workspace = Workspace::new(Layout { root: Some(root), floating: Vec::new() });
+
     for panel in Panel::ALL {
         if let Some(rect) = panel.float_rect() {
-            let location = Location {
-                floating: Some(rect),
-                anchor: None,
-                placement: Placement::Tab { before: None },
-                size: None,
-                stack: None,
-                sibling: Vec::new(),
-                group: None,
-            };
-            workspace.hidden.push((panel, location));
+            workspace.hidden.push((panel, floating_location(rect)));
         }
     }
+
     for panel in [MeshMapSettings, CommonSettings, MeshMapBakers] {
         workspace.hidden.push((
             panel,
@@ -175,7 +177,13 @@ pub fn default_workspace() -> Workspace {
             },
         ));
     }
+
     workspace
+}
+
+/// Where a closed panel reopens as its own floating window at `rect` (`[x, y, width, height]`)
+fn floating_location(rect: [f32; 4]) -> Location<Panel> {
+    Location { floating: Some(rect), anchor: None, placement: Placement::Tab { before: None }, size: None, stack: None, sibling: Vec::new(), group: None }
 }
 
 /// craft-ui's checks plus the viewport's: a saved or hand-edited file cannot hide, float, group
@@ -218,8 +226,11 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // The live dock
 
-/// Width of the bake layout's texture set and mesh map bakers column, in points
-const BAKERS_COLUMN_WIDTH: f32 = 200.0;
+/// Height of a panel group's tab strip, in points
+pub(crate) const TAB_HEIGHT: f32 = 30.0;
+
+/// Width of the bake layout's texture set and mesh map bakers column in points: the reference's scaled to our larger font
+const BAKERS_COLUMN_WIDTH: f32 = 232.0;
 /// Width of the bake layout's common and mesh map settings column, in points
 const SETTINGS_COLUMN_WIDTH: f32 = 330.0;
 /// Height of the log under the bake layout's columns, in points
@@ -344,6 +355,13 @@ impl Dock {
         }
     }
 
+    /// Open the closed `panel` as a floating window at `rect` (`[x, y, width, height]`)
+    pub(crate) fn float_at(&mut self, panel: Panel, rect: [f32; 4]) {
+        self.workspace.hidden.retain(|(hidden_panel, _)| *hidden_panel != panel);
+        self.workspace.hidden.push((panel, floating_location(rect)));
+        self.focus(panel);
+    }
+
     /// One change from the dock area's gestures. A change that is rejected leaves the layout as
     /// it was.
     fn apply(&mut self, action: Action<Panel>) {
@@ -363,29 +381,42 @@ fn area_id() -> Id {
     Id::unique("texturecraft-docking")
 }
 
-/// The dock look: every panel group is a card on the window's frame colour, its tab strip
-/// without hard lines, the shown tab a pill.
-fn style(ui: &Ui, t: &Tokens) -> DockStyle {
-    let mut s = DockStyle::from_ui(ui);
-    s.gap = f32::from(crate::theme::GUTTER);
-    // Smallest panel extent a divider drag leaves.
-    s.min_pane = 60.0;
-    s.background = t.panel;
-    s.tab_background = t.panel;
-    s.active_background = t.button;
-    s.text = t.text_strong;
-    s.inactive_text = t.text_dim;
-    s.border = egui::Stroke::NONE;
-    s.accent = t.accent;
-    s.floating_background = t.panel;
-    s.floating_stroke = egui::Stroke::new(1.0, t.button_border);
-    s.font = egui::FontId::proportional(12.5);
-    s.min_tab_width = 54.0;
-    s.tab_height = 30.0;
-    // Panels arrange in a split tree around the viewport; floating title bars only move windows.
-    s.new_dock_zones = false;
-    s.title_bar_docks = false;
-    s
+/// Smallest panel extent a divider drag leaves, in points
+const MIN_PANE_EXTENT: f32 = 60.0;
+
+/// Border width of a floating panel, in points
+const FLOATING_BORDER_WIDTH: f32 = 1.0;
+
+/// Text size of the panel tabs, in points
+const TAB_TEXT_SIZE: f32 = 12.5;
+
+/// Narrowest panel tab, in points
+const MIN_TAB_WIDTH: f32 = 54.0;
+
+/// The dock look: each panel group a card on the window's frame colour, tab strips without hard lines, the shown tab a pill
+fn style(ui: &Ui, tokens: &Tokens) -> DockStyle {
+    let mut dock_style = DockStyle::from_ui(ui);
+    dock_style.gap = f32::from(crate::theme::GUTTER);
+    dock_style.min_pane = MIN_PANE_EXTENT;
+
+    dock_style.background = tokens.panel;
+    dock_style.tab_background = tokens.panel;
+    dock_style.active_background = tokens.button;
+    dock_style.text = tokens.text_strong;
+    dock_style.inactive_text = tokens.text_dim;
+    dock_style.border = egui::Stroke::NONE;
+    dock_style.accent = tokens.accent;
+    dock_style.floating_background = tokens.panel;
+    dock_style.floating_stroke = egui::Stroke::new(FLOATING_BORDER_WIDTH, tokens.button_border);
+
+    dock_style.font = egui::FontId::proportional(TAB_TEXT_SIZE);
+    dock_style.min_tab_width = MIN_TAB_WIDTH;
+    dock_style.tab_height = TAB_HEIGHT;
+
+    // Panels arrange in a split tree around the viewport; floating title bars only move windows
+    dock_style.new_dock_zones = false;
+    dock_style.title_bar_docks = false;
+    dock_style
 }
 
 /// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,
@@ -415,57 +446,77 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     if let Some(panel) = app.ui.dock.raise.take() {
         area = area.raise_panel(panel);
     }
-    let output = area.show_content(ui, &layout, &style, &mut Panels { app, tk: tokens });
+    let output = area.show_content(ui, &layout, &style, &mut Panels { app, tokens });
+    crate::rail_popup::hand_drag_to_dock(&context, area_id());
+
+    // After the dock, which records the viewport the popup reaches into, and before a changed layout returns early
+    crate::rail_popup::show(app, &context);
+
     #[cfg(not(target_arch = "wasm32"))]
     crate::menus::forwarded_shortcuts(app, &context, output.forwarded_events, output.forwarded_modifiers.unwrap_or_default());
     if let Some(error) = &output.error {
         log::warn!("docking: {error}");
     }
+
     // A layout changed by a panel takes priority over gestures from the old layout
     if app.ui.dock.workspace.layout != layout {
         craft_ui::docking::cancel_drag::<Panel>(&context, area_id());
         return;
     }
+
     for action in output.actions {
         app.ui.dock.apply(action);
     }
 }
 
-/// The panels' contents, names and limits for the dock area.
+/// The panels' contents, names and limits for the dock area
 struct Panels<'a> {
     app: &'a mut TextureCraftApp,
-    tk: Tokens,
+    tokens: Tokens,
+}
+
+/// Room between a panel's edges and its contents
+const PANEL_BODY_MARGIN: Margin = Margin::symmetric(8, 4);
+
+/// The body of every panel except the viewport, in the dock or on the rail
+pub(crate) fn panel_body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
+    // No project open: the library and the log work, the other panels about a project stay empty
+    let works_empty = matches!(panel, Panel::Assets | Panel::Log | Panel::Layers | Panel::TextureSetList | Panel::Properties);
+    if !app.session.project_open && !works_empty {
+        return;
+    }
+
+    egui::Frame::new().inner_margin(PANEL_BODY_MARGIN).show(ui, |ui| match panel {
+        Panel::MeshMapSettings => crate::bake_mode::mesh_map_settings_panel(app, ui),
+        Panel::Assets => crate::shelf::body(app, ui),
+        Panel::CommonSettings => crate::bake_mode::common_settings_panel(app, ui),
+        Panel::MeshMapBakers => crate::bake_mode::mesh_map_bakers_panel(app, ui),
+        Panel::TextureSetList if app.ui.mode == crate::state::Mode::Baking => crate::bake_mode::texture_sets(app, ui),
+        Panel::TextureSetList => crate::dock::texture_set_list(app, ui),
+        Panel::Layers => crate::dock::layers(app, ui),
+        Panel::TextureSetSettings => crate::dock::texture_set_settings(app, ui),
+        Panel::Properties => crate::dock::properties(app, ui),
+
+        // Display and Shader Settings scroll here, as tall as their contents; History and Log scroll their own lists
+        Panel::Display => egui::ScrollArea::vertical().id_salt("dock-display").auto_shrink([false, true]).show(ui, |ui| crate::windows::display(app, ui)).inner,
+        Panel::Shader => egui::ScrollArea::vertical().id_salt("dock-shader").auto_shrink([false, true]).show(ui, |ui| crate::windows::shader(app, ui)).inner,
+        Panel::History => crate::windows::history(app, ui),
+        Panel::Log => crate::windows::log(app, ui),
+        Panel::Viewport => {}
+    });
 }
 
 impl DockContent<Panel> for Panels<'_> {
     fn body(&mut self, ui: &mut Ui, panel: &Panel) {
         let app = &mut *self.app;
         if *panel == Panel::Viewport {
-            ui.painter().rect_filled(ui.max_rect(), 0.0, self.tk.viewport);
+            crate::rail_popup::remember_viewport(ui.ctx(), ui.max_rect());
+            ui.painter().rect_filled(ui.max_rect(), 0.0, self.tokens.viewport);
             crate::viewport::central(app, ui);
             return;
         }
-        egui::Frame::new().inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| match panel {
-            Panel::MeshMapSettings => crate::bake_mode::mesh_map_settings_panel(app, ui),
-            Panel::Assets => crate::shelf::body(app, ui),
-            Panel::CommonSettings => crate::bake_mode::common_settings_panel(app, ui),
-            Panel::MeshMapBakers => crate::bake_mode::mesh_map_bakers_panel(app, ui),
-            Panel::TextureSetList if app.ui.mode == crate::state::Mode::Baking => crate::bake_mode::texture_sets(app, ui),
-            Panel::TextureSetList => crate::dock::texture_set_list(app, ui),
-            Panel::Layers => crate::dock::layers(app, ui),
-            Panel::TextureSetSettings => crate::dock::texture_set_settings(app, ui),
-            Panel::Properties => crate::dock::properties(app, ui),
-            // The other panels scroll their own lists.
-            Panel::Display => {
-                egui::ScrollArea::vertical().id_salt("dock-display").auto_shrink([false, false]).show(ui, |ui| crate::windows::display(app, ui)).inner
-            }
-            Panel::Shader => {
-                egui::ScrollArea::vertical().id_salt("dock-shader").auto_shrink([false, false]).show(ui, |ui| crate::windows::shader(app, ui)).inner
-            }
-            Panel::History => crate::windows::history(app, ui),
-            Panel::Log => crate::windows::log(app, ui),
-            Panel::Viewport => {}
-        });
+
+        panel_body(app, ui, *panel);
     }
 
     fn logical_label(&self, panel: &Panel) -> String {

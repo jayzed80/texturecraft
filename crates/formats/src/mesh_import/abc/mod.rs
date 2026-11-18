@@ -88,7 +88,7 @@ trait Archive {
 }
 
 /// Numbers of a POD type, little-endian (Alembic's POD numbering: 0 bool, 1 u8, 2 i8, 3 u16,
-/// 4 i16, 5 u32, 6 i32, 7 u64, 8 i64, 10 f32, 11 f64); `None` for other types.
+/// 4 i16, 5 u32, 6 i32, 7 u64, 8 i64, 9 f16, 10 f32, 11 f64); `None` for other types.
 fn pod_values(pod: u32, raw: &[u8]) -> Option<Vec<f64>> {
     Some(match pod {
         0 | 1 => raw.iter().map(|v| *v as f64).collect(),
@@ -99,6 +99,7 @@ fn pod_values(pod: u32, raw: &[u8]) -> Option<Vec<f64>> {
         6 => raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as f64).collect(),
         7 => raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c) as f64).collect(),
         8 => raw.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c) as f64).collect(),
+        9 => raw.as_chunks::<2>().0.iter().map(|c| half::f16::from_bits(u16::from_le_bytes(*c)).to_f64()).collect(),
         10 => raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as f64).collect(),
         11 => raw.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect(),
         _ => return None,
@@ -109,7 +110,7 @@ fn pod_values(pod: u32, raw: &[u8]) -> Option<Vec<f64>> {
 fn pod_bytes(pod: u32) -> Option<usize> {
     match pod {
         0..=2 => Some(1),
-        3 | 4 => Some(2),
+        3 | 4 | 9 => Some(2),
         5 | 6 | 10 => Some(4),
         7 | 8 | 11 => Some(8),
         _ => None,
@@ -353,13 +354,8 @@ fn read_inner(bytes: &[u8]) -> Result<RawMesh> {
     if root.len() < 6 || !(0..6).all(|i| is_data(i) != (i == 2)) {
         return Err(malformed(KIND, "the archive group does not have the Alembic layout"));
     }
-    // Indexed metadata: a u8 length before each string.
     let block = o.data(root[5])?;
-    let mut c = Cursor { b: block, pos: 0 };
-    while c.pos < block.len() {
-        let n = c.u8()? as usize;
-        o.indexed_meta.push(c.string(n)?);
-    }
+    read_indexed_meta(block, &mut o.indexed_meta)?;
     walk(o, &root[2])
 }
 
@@ -369,6 +365,22 @@ fn walk<A: Archive>(archive: A, top: &A::Handle) -> Result<RawMesh> {
     let mut walk = Walk { a: archive, sink: &mut sink, visits: 0 };
     walk.object(top, Mat4::IDENTITY, "", 0)?;
     Ok(sink.finish())
+}
+
+/// The most indexed metadata entries that can ever be used: objects and properties refer to one
+/// with a single byte, and 0xff already means "stored inline", so only 0 to 254 are reachable.
+const MAX_INDEXED_META: usize = 255;
+
+/// Indexed metadata: a u8 length before each string. `out` starts with the empty entry 0. Reading
+/// stops once `out` holds [`MAX_INDEXED_META`] entries, because no later entry can be referred to
+/// and an empty one costs a whole `String` in memory for one byte of file.
+fn read_indexed_meta(block: &[u8], out: &mut Vec<String>) -> Result<()> {
+    let mut c = Cursor { b: block, pos: 0 };
+    while c.pos < block.len() && out.len() < MAX_INDEXED_META {
+        let n = c.u8()? as usize;
+        out.push(c.string(n)?);
+    }
+    Ok(())
 }
 
 struct Walk<'b, A> {
@@ -608,7 +620,7 @@ impl<A: Archive> Walk<'_, A> {
                         Vec2::ZERO
                     }
                 });
-                corners.push(Corner { p: *p, n, uv });
+                corners.push(Corner { p: *p, n, uv, color: None });
             }
             k = end;
             if !keep_order {

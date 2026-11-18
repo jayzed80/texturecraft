@@ -38,6 +38,7 @@ fn version() -> String {
 struct Args {
     file: Option<String>,
     control: Option<u16>,
+    /// With `--control`: start with an empty material ball instead of the sample project
     empty: bool,
     gpu: Option<String>,
     power_pref: Option<eframe::wgpu::PowerPreference>,
@@ -84,21 +85,34 @@ fn parse_args_from<I: IntoIterator<Item = String>>(it: I) -> Result<Option<Args>
 }
 
 fn initial_session(args: &Args) -> Session {
-    if let Some(f) = &args.file {
-        match texturecraft_engine::file_cmds::open_path(f) {
-            Ok(s) => return s,
-            Err(e) => eprintln!("texturecraft: could not open {f}: {e}"),
+    if let Some(path) = &args.file {
+        match texturecraft_engine::file_cmds::open_path(path) {
+            Ok(session) => return session,
+            Err(error) => eprintln!("texturecraft: could not open {path}: {error}"),
         }
     }
-    if !args.empty
-        && let Ok(s) = texturecraft_engine::sample_session(2048, 512)
-    {
-        return s;
+
+    // Control runs retain their sample project; interactive runs start empty
+    if args.control.is_some() {
+        if !args.empty
+            && let Ok(session) = texturecraft_engine::sample_session(2048, 512)
+        {
+            return session;
+        }
+
+        return match Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("texturecraft: {error}");
+                std::process::exit(1);
+            }
+        };
     }
-    match Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("texturecraft: {e}");
+
+    match Session::closed() {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("texturecraft: {error}");
             std::process::exit(1);
         }
     }
@@ -121,16 +135,16 @@ fn set_taskbar_icon(w: &winit::window::Window) {
     }
 }
 
-/// Settings › Interface › System title bar, read before the window opens from `ui.json`, else as earlier builds saved it; missing or unreadable: off
-fn saved_system_title_bar(ui_file: Option<&std::path::Path>, persistence_path: Option<&std::path::Path>) -> bool {
+/// Preferences needed before opening the initial project or window, with legacy storage fallback.
+fn saved_prefs(ui_file: Option<&std::path::Path>, persistence_path: Option<&std::path::Path>) -> texturecraft_ui_egui::state::Prefs {
     if let Some(ui) = ui_file.and_then(ui_state_store::read) {
-        return ui.prefs.system_title_bar;
+        return ui.prefs;
     }
 
     let file = persistence_path.map(std::path::Path::to_path_buf).or_else(|| eframe::storage_dir(APP_NAME).map(|folder| folder.join("app.ron")));
     let saved = file.and_then(|file| std::fs::read_to_string(file).ok());
     let entries = saved.and_then(|text| ron::from_str::<std::collections::HashMap<String, String>>(&text).ok());
-    entries.and_then(|entries| ron::from_str::<UiState>(entries.get("ui")?).ok()).is_some_and(|ui| ui.prefs.system_title_bar)
+    entries.and_then(|entries| ron::from_str::<UiState>(entries.get("ui")?).ok()).map(|ui| ui.prefs).unwrap_or_default()
 }
 
 /// The app with the window chrome that needs the native window: the Windows borderless guard, and
@@ -176,7 +190,7 @@ fn checks_for_updates_at_start(control: Option<u16>) -> bool {
 }
 
 fn main() {
-    // Windows: the update helper is a copy of this program started with `--finish-update`.
+    // Windows: the update helper is a copy of this program started with `--finish-update`
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&texturecraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
         std::process::exit(i32::from(result.is_err()));
@@ -189,15 +203,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+
     // Errors before the window opens speak the system's language; the app then applies the saved one
     texturecraft_ui_egui::i18n::set_language(texturecraft_ui_egui::i18n::os_language());
-    let prev = std::panic::take_hook();
+    let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A message box needs the main thread on macOS; other threads' panics are only logged
         fatal(&format!("internal error: {info}"), std::thread::current().name() == Some("main"));
-        prev(info);
+        previous_hook(info);
     }));
-    let session = initial_session(&args);
+
     // Scripted runs (agents, films, tests) set TEXTURECRAFT_NO_PREFS to keep the user's saved settings untouched: state goes to throwaway files
     let persistence_path =
         std::env::var_os("TEXTURECRAFT_NO_PREFS").map(|_| std::env::temp_dir().join(format!("texturecraft-noprefs-{}.ron", std::process::id())));
@@ -206,7 +221,10 @@ fn main() {
     if let Some(file) = &ui_file {
         let _ = ui_state_store::FILE.set(file.clone());
     }
-    let title_bar = TitleBar::decide(saved_system_title_bar(ui_file.as_deref(), persistence_path.as_deref()));
+    let prefs = saved_prefs(ui_file.as_deref(), persistence_path.as_deref());
+    prefs.apply_resource_limits();
+    let session = initial_session(&args);
+    let title_bar = TitleBar::decide(prefs.system_title_bar);
     let mut viewport = egui::ViewportBuilder::default().with_title(APP_NAME).with_inner_size(DEFAULT_SIZE).with_min_inner_size(MIN_SIZE);
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
@@ -218,9 +236,7 @@ fn main() {
         std::process::exit(2);
     }
     let control = args.control;
-    // The start window offers new, open and recent projects, unless a file was given or a script drives the app
-    let start = args.file.is_none() && control.is_none();
-    let r = eframe::run_native(
+    let result = eframe::run_native(
         APP_NAME,
         options,
         Box::new(move |cc| {
@@ -228,7 +244,8 @@ fn main() {
             if let Some(w) = cc.winit_window() {
                 set_taskbar_icon(w);
             }
-            // winit's Quit ends the process without asking; this menu's asks like the close button.
+
+            // winit's Quit ends the process without asking; this menu's asks like the close button
             #[cfg(target_os = "macos")]
             if let Err(e) = craft_menu::mac::install_app_menu(&cc.egui_ctx, APP_NAME) {
                 log::warn!("the app menu could not be installed: {e}");
@@ -236,7 +253,6 @@ fn main() {
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
-            app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
             if let Some(port) = control {
                 app.control = Some(control_server::start(port, cc.egui_ctx.clone()));
@@ -249,7 +265,7 @@ fn main() {
             }))
         }),
     );
-    if let Err(e) = r {
+    if let Err(e) = result {
         fatal(&e.to_string(), true);
         std::process::exit(1);
     }
@@ -331,27 +347,36 @@ mod tests {
     }
 
     #[test]
-    fn the_system_title_bar_setting_is_read_from_ui_json_else_as_earlier_builds_saved_it() {
+    fn startup_preferences_use_ui_json_then_legacy_storage_then_defaults() {
         let ron_path = std::env::temp_dir().join(format!("texturecraft-titlebar-test-{}.ron", std::process::id()));
         let json_path = ron_path.with_extension("json");
         for on in [false, true] {
             let mut ui = UiState::default();
             ui.prefs.system_title_bar = on;
+            ui.prefs.project_open_limit_gib = 16;
+
             // Written as eframe writes it: a pretty RON map of RON strings
             let kv = std::collections::HashMap::from([("ui".to_string(), ron::to_string(&ui).unwrap())]);
             std::fs::write(&ron_path, ron::Options::default().to_string_pretty(&kv, Default::default()).unwrap()).unwrap();
-            assert_eq!(saved_system_title_bar(None, Some(&ron_path)), on);
+
+            let legacy = saved_prefs(None, Some(&ron_path));
+            assert_eq!(legacy.system_title_bar, on);
+            assert_eq!(legacy.project_open_limit_gib, 16);
 
             ui.prefs.system_title_bar = !on;
+            ui.prefs.project_open_limit_gib = 32;
             std::fs::write(&json_path, serde_json::to_vec(&ui).unwrap()).unwrap();
-            assert_eq!(saved_system_title_bar(Some(&json_path), Some(&ron_path)), !on, "ui.json comes first");
+
+            let current = saved_prefs(Some(&json_path), Some(&ron_path));
+            assert_eq!(current.system_title_bar, !on, "ui.json comes first");
+            assert_eq!(current.project_open_limit_gib, 32);
         }
 
         std::fs::write(&json_path, "not json").unwrap();
         std::fs::write(&ron_path, "not ron").unwrap();
-        assert!(!saved_system_title_bar(Some(&json_path), Some(&ron_path)));
+        assert_eq!(saved_prefs(Some(&json_path), Some(&ron_path)), texturecraft_ui_egui::state::Prefs::default());
         std::fs::remove_file(&json_path).unwrap();
         std::fs::remove_file(&ron_path).unwrap();
-        assert!(!saved_system_title_bar(Some(&json_path), Some(&ron_path)));
+        assert_eq!(saved_prefs(Some(&json_path), Some(&ron_path)), texturecraft_ui_egui::state::Prefs::default());
     }
 }
