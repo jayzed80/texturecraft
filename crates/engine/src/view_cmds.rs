@@ -6,12 +6,30 @@ use texturecraft_core::{BakedMap, Channel, ToneMapping};
 use texturecraft_geom::glam::Vec3;
 
 use crate::commands::{CommandSpec, always, bad, boolp, can_redo, can_undo, color_param, f32p, strp, u64p};
+use crate::frame_target::FrameTarget;
 use crate::session::ViewMode;
 use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!("viewport.frame", "Show entire mesh", ["Viewport"], Some("F"), "{}", always, frame),
+        cmd!(
+            "viewport.frame",
+            "Show entire mesh",
+            ["Viewport"],
+            Some("F"),
+            "{target?: \"all\" (default: the whole mesh, helper geometry included) | \"selection\" (the active texture set's geometry)} → the camera; the orbit turns around the framed center",
+            always,
+            frame
+        ),
+        cmd!(
+            "viewport.frameSelection",
+            "Frame texture set",
+            ["Viewport"],
+            Some("Shift+F"),
+            "{} → the camera, framing the active texture set's geometry",
+            always,
+            |s, _| frame_target(s, FrameTarget::Selection)
+        ),
         cmd!("viewport.displayMaterial", "Display material", ["Viewport"], Some("M"), "{}", always, |s, _| set_view(s, ViewMode::Material)),
         cmd!("viewport.nextChannel", "Display next channel", ["Viewport"], Some("C"), "{}", always, |s, _| cycle_channel(s, 1)),
         cmd!("viewport.previousChannel", "Display previous channel", ["Viewport"], Some("Shift+C"), "{}", always, |s, _| cycle_channel(s, -1)),
@@ -26,7 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Display settings",
             [],
             None,
-            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] (linear) | \"#rrggbb\", scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}}",
+            "{environment?: <built-in>|resource:<image resource>, exposure?, blur?, rotation?, opacity?, toneMapping?: linear|aces, fov?, shadows?, aoIntensity?, bloom?, vignette?, sharpen?, grain?, postEffects?, taa?, specGloss?, parallax?, displacement? (the viewport moves the surface by the height channel), scatterColor?: [r,g,b] linear or \"#rrggbb\" sRGB, scatterRadius? (0..1 of the mesh radius), ior? (1..3, transmission), dof?: {enabled?, focusDistance? (view depth, world units; 0 = the orbit target), aperture? (lens radius, 0..1 of the mesh radius)}}",
             always,
             display
         ),
@@ -80,8 +98,24 @@ fn repeat(s: &mut Session, p: &Value, step: fn(&mut Session) -> Result<String>) 
     Ok((last, n))
 }
 
-fn frame(s: &mut Session, _: &Value) -> Result<Value> {
-    let (lo, hi) = s.mesh.bounds();
+fn frame(s: &mut Session, p: &Value) -> Result<Value> {
+    let target = match strp(p, "target") {
+        None | Some("all") => FrameTarget::All,
+        Some("selection") => FrameTarget::Selection,
+        Some(other) => return Err(bad("viewport.frame", format!("unknown target `{other}` (all or selection)"))),
+    };
+
+    frame_target(s, target)
+}
+
+/// Frame the whole mesh, or only the triangles of the active texture set's material (the thing
+/// being painted, without a floor plane or other helper geometry), and orbit around that center.
+fn frame_target(s: &mut Session, target: FrameTarget) -> Result<Value> {
+    let selection = match target {
+        FrameTarget::Selection => s.doc.project.texture_sets.get(s.ts()).and_then(|set| s.mesh.bounds_of_material(set.material)),
+        FrameTarget::All => None,
+    };
+    let (lo, hi) = selection.unwrap_or_else(|| s.mesh.bounds());
     s.camera.frame(lo, hi);
     s.revision = s.revision.wrapping_add(1);
     Ok(camera_json(s))
@@ -211,6 +245,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(e) = env.as_deref().filter(|e| !e.starts_with(texturecraft_core::project::ENV_RESOURCE_PREFIX) && !ENVIRONMENTS.contains(e)) {
         return Err(bad("display.set", format!("unknown environment `{e}`: one of {}, or resource:<image>", ENVIRONMENTS.join(", "))));
     }
+    let scatter_color = color_param("display.set", p, "scatterColor")?;
     let d = &mut s.doc.project.display;
     if let Some(e) = env {
         d.environment = e;
@@ -236,7 +271,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(t) = tm {
         d.tone_mapping = t;
     }
-    if let Some(c) = color_param(p, "scatterColor") {
+    if let Some(c) = scatter_color {
         d.scatter_color = c.map(|v| v.clamp(0.0, 1.0));
     }
     if let Some(b) = boolp(p, "shadows") {
