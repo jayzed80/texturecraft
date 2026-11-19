@@ -130,30 +130,31 @@ fn current_key(source: &Source) -> Option<String> {
 
 /// The Resources tab: the patterns, the project's images and a uniform value
 fn tiles(app: &mut TextureCraftApp, ctx: &egui::Context) -> Vec<ResourcePickerTile<'static>> {
-    let mut tiles: Vec<ResourcePickerTile<'static>> = ProceduralKind::ALL
-        .into_iter()
-        .map(|kind| ResourcePickerTile {
-            key: format!("{PATTERN_PREFIX}{}", kind.label()),
-            label: tr(kind.label()).to_string(),
-            group: tr("Patterns"),
-            thumbnail: app.thumbs.procedural(ctx, kind),
-            image: None,
-            preview: Box::new(move || ShelfPreview::Procedural(kind)),
-        })
-        .collect();
-    let mut names: Vec<(String, Arc<ImageRes>)> = app.session.images.iter().map(|(name, image)| (name.clone(), image.clone())).collect();
-    names.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, image) in names {
+    let mut tiles = Vec::with_capacity(ProceduralKind::ALL.len() + app.session.images.len() + 1);
+    tiles.extend(ProceduralKind::ALL.into_iter().map(|kind| ResourcePickerTile {
+        key: format!("{PATTERN_PREFIX}{}", kind.label()),
+        label: tr(kind.label()).to_string(),
+        group: tr("Patterns"),
+        thumbnail: None,
+        image: None,
+        preview: Box::new(move || ShelfPreview::Procedural(kind)),
+    }));
+
+    let first_image = tiles.len();
+    for (name, image) in &app.session.images {
         let preview_name = name.clone();
+        let preview_image = image.clone();
         tiles.push(ResourcePickerTile {
             key: format!("{IMAGE_PREFIX}{name}"),
-            label: name,
+            label: name.clone(),
             group: tr("Images"),
             thumbnail: None,
             image: Some(image.clone()),
-            preview: Box::new(move || ShelfPreview::Image(preview_name.clone(), image.clone())),
+            preview: Box::new(move || ShelfPreview::Image(preview_name.clone(), preview_image.clone())),
         });
     }
+    tiles[first_image..].sort_unstable_by(|left, right| left.label.cmp(&right.label));
+
     tiles.push(ResourcePickerTile {
         key: UNIFORM_KEY.to_string(),
         label: tr("Uniform value").to_string(),
@@ -162,6 +163,7 @@ fn tiles(app: &mut TextureCraftApp, ctx: &egui::Context) -> Vec<ResourcePickerTi
         image: None,
         preview: Box::new(|| ShelfPreview::Image(UNIFORM_SWATCH_NAME.to_string(), UNIFORM_SWATCH.clone())),
     });
+
     tiles
 }
 
@@ -239,6 +241,38 @@ mod tests {
 
     fn image_preview_count(context: &egui::Context) -> usize {
         context.tex_manager().read().allocated().filter(|(_, metadata)| metadata.name.starts_with("res_picker-image-")).count()
+    }
+
+    #[test]
+    fn searching_the_picker_only_renders_visible_pattern_previews() {
+        let mut session = Session::new_project("picker", primitives::plane(1.0, 1), "builtin:plane", None, 128).unwrap();
+        execute(&mut session, "layer.add.fill", &json!({"height": 0.5})).unwrap();
+        let mut harness = picker_harness(session, Vec::new());
+        let texture_manager = harness.ctx.tex_manager();
+        let pattern_texture_count = || texture_manager.read().allocated().filter(|(_, metadata)| metadata.name.starts_with("thumb_proc:")).count();
+
+        harness.get_by_role_and_label(egui::Role::ComboBox, "Source").click();
+        harness.run_steps(2);
+        harness.event(egui::Event::Text("Smooth fur".into()));
+        harness.run_steps(30);
+
+        let after_search = pattern_texture_count();
+        let matching_preview = texture_manager.read().allocated().any(|(_, metadata)| metadata.name == "thumb_proc:SmoothFur");
+        eprintln!("pattern previews after filtered frames: {after_search} of {}", ProceduralKind::ALL.len());
+        assert!(matching_preview, "the selected search result must get a swatch");
+        assert!(after_search < ProceduralKind::ALL.len(), "filtered frames must not fill the complete procedural cache");
+
+        harness.get_by_role_and_label(egui::Role::Button, "Smooth fur").click();
+        harness.run_steps(3);
+        let app = &harness.state().0;
+        let layer = app.session.selected_layer().unwrap();
+        let LayerKind::Fill(fill) = &app.session.doc.project.layers[&layer].kind else { panic!("a fill layer") };
+
+        assert!(matches!(fill.source(Channel::Height), Source::Procedural { pattern, .. } if pattern.kind == ProceduralKind::SmoothFur));
+        assert_eq!(pattern_texture_count(), after_search, "closing the picker reuses the selected swatch");
+        drop(harness);
+
+        assert_eq!(pattern_texture_count(), 0, "dropping the app releases procedural swatches");
     }
 
     #[test]

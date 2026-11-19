@@ -234,6 +234,7 @@ fn group_header(ui: &mut Ui, text: &str) {
 fn grid(ui: &mut Ui, thumbs: &mut Thumbs, tiles: &[ResourcePickerTile<'_>], query: &str, current: Option<&str>, reveal_current: bool) -> Option<String> {
     let tokens = Tokens::get(ui.ctx());
     let shown: Vec<&ResourcePickerTile<'_>> = tiles.iter().filter(|tile| shelf::matches(query, &[&tile.label, &tile.key])).collect();
+
     let mut picked = None;
     for group in shelf::categories(&shown, |tile| tile.group) {
         group_header(ui, group);
@@ -242,23 +243,35 @@ fn grid(ui: &mut Ui, thumbs: &mut Thumbs, tiles: &[ResourcePickerTile<'_>], quer
                 let response = shelf::tile(
                     ui,
                     thumbs,
-                    |ui, thumbs| tile.image.as_ref().map(|image| thumbs.image(ui.ctx(), &tile.label, image)).or_else(|| tile.thumbnail.clone()),
+                    |ui, thumbs| {
+                        if let Some(image) = &tile.image {
+                            return Some(thumbs.image(ui.ctx(), &tile.label, image));
+                        }
+
+                        tile.thumbnail.clone().or_else(|| match (tile.preview)() {
+                            ShelfPreview::Procedural(kind) => thumbs.procedural(ui.ctx(), kind),
+                            _ => None,
+                        })
+                    },
                     || (tile.preview)(),
                     &tile.label,
                     None,
                 );
+
                 if current == Some(tile.key.as_str()) {
                     if reveal_current {
                         response.scroll_to_me(Some(egui::Align::Center));
                     }
                     ui.painter().rect_stroke(response.rect, TILE_ROUNDING, Stroke::new(CURRENT_OUTLINE_WIDTH, tokens.accent), egui::StrokeKind::Inside);
                 }
+
                 if response.clicked() {
                     picked = Some(tile.key.clone());
                 }
             }
         });
     }
+
     picked
 }
 

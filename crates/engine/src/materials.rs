@@ -844,8 +844,8 @@ pub fn apply_at(s: &mut Session, id: &str, place: Place) -> Result<LayerId> {
 }
 
 impl Place {
-    /// From `above` (+ `inside`) or `index` params; the selection by default.
-    pub(crate) fn from_params(p: &serde_json::Value) -> Place {
+    /// Parse a drop position from the command parameters, defaulting to the selection.
+    pub fn from_params(p: &serde_json::Value) -> Place {
         match (crate::commands::u64p(p, "above"), crate::commands::u64p(p, "below"), crate::commands::u64p(p, "index")) {
             (Some(above), _, _) => Place::Above(LayerId(above), crate::commands::boolp(p, "inside").unwrap_or(false)),
             (None, Some(below), _) => Place::Below(LayerId(below)),

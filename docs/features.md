@@ -66,17 +66,22 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   mask to view it alone. Drag an effect to reorder its stack, or right-click it to duplicate it
   (painted strokes included) or copy it onto another layer or mask (Ctrl+C, Ctrl+V); with an
   effect selected, Ctrl+D and Delete duplicate or remove it.
-- **Fill layers** take uniform values, **23 procedurals** (clouds, cells, grunge, scratches, wood
-  grain, bricks, fabric weave, twill, leather grain, marble veins, Voronoi, paint chips…) or your own
-  **images**, through UV, tri-planar, planar, spherical, cylindrical or decal projection, with
-  the UV scale, rotation and offset, the tri-planar blend sharpness and offset, the planar axis
-  and offset, and the cylindrical axis in the fill's properties. Each channel takes its own image (a normal, roughness or height map, say): pick it in the channel's
-  source menu, which also imports one, or drop it from the Assets panel onto the channel. A
-  normal map image made for DirectX (Y down) is marked with **DirectX normal map** under it.
-  A color channel's procedural or anchor point takes a **gradient map** (*Gradient Map* in the
-  channel's source menu): up to 16 color stops, dark to light, color the pattern, or recolor
-  the stack below by its lightness, without touching the other channels. The **Gradient map**
-  filter does the same for a whole layer's content.
+- **Fill layers** take uniform values, **43 procedurals** (clouds, cells, grunge, scratches, wood
+  grain, bricks, Tile Generator, fabric weave, twill, leather grain, marble veins, Voronoi, paint
+  chips, hexagon tiles, wave scales, herringbone planks, halftone dots, diamond brocade, Truchet
+  arcs, smooth fur, mackerel sky, soft billow, reptile scales, young bark, rotting flesh,
+  camouflage, knit stitches, basket weave, goose-eye twill, slub silk, strip flooring, knotty
+  wood…) or your own **images**. Patterns and images support UV, tri-planar, planar, spherical,
+  cylindrical and decal projection. The fill's properties expose UV scale, rotation and offset,
+  tri-planar blend sharpness and offset, planar axis and offset, and cylindrical axis. Set the
+  pattern resolution separately for each source. Each channel takes its own image, such as a
+  normal, roughness or height map. Import it with *File › Import resources...*, then select it
+  in the channel's source picker or drop it from the Assets panel onto the channel. Mark
+  DirectX normal maps (Y down) with **DirectX normal map**.
+  For a color channel that reads a pattern or anchor point, choose **Gradient Map** from the
+  three-dot menu beside its source slot. Up to 16 color stops map dark to light across the
+  pattern or recolor the stack below by its lightness. The **Gradient map** filter does the
+  same for a whole layer's content.
   Alt+click a material channel (of a fill or the brush) to keep that channel alone.
 - **72 materials** (metals from measured reflectance, car paint, brushed anisotropic steel,
   velvet, skin, wax, glass, ice, woods, bamboo, bark, stone, cobblestone, gravel, plaster, sand,

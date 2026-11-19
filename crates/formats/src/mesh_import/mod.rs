@@ -357,23 +357,49 @@ pub fn import_high_poly_bytes(file_name: &str, bytes: &[u8]) -> Result<HighPolyM
 /// Decode a base color texture to RGBA8, at most [`BASE_COLOR_SIDE`] per side, charging its
 /// texels to `budget`.
 fn decode_base_color(bytes: &[u8], budget: &mut u64) -> Result<(u32, u32, Vec<[u8; 4]>)> {
-    let bad = |e: image::ImageError| FormatError::Malformed { kind: "image", msg: e.to_string() };
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| bad(e.into()))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(crate::MAX_IMAGE_SIZE);
-    limits.max_image_height = Some(crate::MAX_IMAGE_SIZE);
-    reader.limits(limits);
-    let img = crate::guard("image", || reader.decode().map_err(bad))?;
-    let img =
-        if img.width().max(img.height()) > BASE_COLOR_SIDE { img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle) } else { img };
-    let rgba = img.into_rgba8();
-    let (w, h) = rgba.dimensions();
+    let bad = |e: craft_image_codecs::CodecError| FormatError::Malformed { kind: "image", msg: e.to_string() };
+    let mut opts = craft_image_codecs::DecodeOptions::default();
+    opts.limits.max_width = crate::MAX_IMAGE_SIZE;
+    opts.limits.max_height = crate::MAX_IMAGE_SIZE;
+    // Mesh UVs refer to stored pixels, not an EXIF-adjusted photograph.
+    opts.keep_orientation = true;
+    // Preserve the prior ImageReader allocation limit; this is not a total RSS cap.
+    opts.limits.max_alloc = 512 << 20;
+    let img = crate::guard("image", || craft_image_codecs::decode_with(bytes, &opts).map_err(bad))?;
+    let (w, h, rgba) = if img.width().max(img.height()) > BASE_COLOR_SIDE {
+        use craft_image_codecs::{ChannelLayout, SampleType};
+        let invalid = || FormatError::Malformed { kind: "image", msg: "invalid RGBA buffer".into() };
+        // Keep native precision through filtering. Converting HDR to u8 first clips highlights.
+        // Bound expanded RGBA storage before conversion as well as the decoder's native output.
+        let mut dyn_img = match img.sample_type() {
+            SampleType::F16 | SampleType::F32 => {
+                let rgba = img.to_rgba_f32(&opts.limits).map_err(bad)?;
+                image::DynamicImage::ImageRgba32F(image::Rgba32FImage::from_raw(img.width(), img.height(), rgba).ok_or_else(invalid)?)
+            }
+            SampleType::U16 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U16).map_err(bad)?;
+                image::DynamicImage::ImageRgba16(image::ImageBuffer::from_raw(img.width(), img.height(), img.to_rgba16()).ok_or_else(invalid)?)
+            }
+            SampleType::U8 => {
+                opts.limits.check(img.width(), img.height(), ChannelLayout::Rgba, SampleType::U8).map_err(bad)?;
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(img.width(), img.height(), img.to_rgba8()).ok_or_else(invalid)?)
+            }
+        };
+        dyn_img = dyn_img.resize(BASE_COLOR_SIDE, BASE_COLOR_SIDE, image::imageops::FilterType::Triangle);
+        let rgba = dyn_img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        (w, h, rgba.pixels().map(|p| p.0).collect::<Vec<[u8; 4]>>())
+    } else {
+        let rgba = img.to_rgba8();
+        let pixels = rgba.as_chunks::<4>().0.to_vec();
+        (img.width(), img.height(), pixels)
+    };
     let texels = u64::from(w) * u64::from(h);
     if texels > *budget {
         return Err(FormatError::TooLarge(format!("the base color textures exceed {} megatexels", BASE_COLOR_TEXELS >> 20)));
     }
     *budget -= texels;
-    Ok((w, h, rgba.pixels().map(|p| p.0).collect()))
+    Ok((w, h, rgba))
 }
 
 fn read(file_name: &str, bytes: &[u8]) -> Result<RawMesh> {

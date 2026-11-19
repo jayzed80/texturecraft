@@ -39,6 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
 
 /// Largest accepted resource file.
 pub(crate) const MAX_BYTES: usize = 512 << 20;
+pub(crate) const EXR_SIGNATURE: &[u8] = &[0x76, 0x2f, 0x31, 0x01];
 
 pub(crate) fn decoded(d: texturecraft_formats::DecodedImage) -> Arc<ImageRes> {
     Arc::new(ImageRes { width: d.width, height: d.height, rgba: d.rgba, srgb: d.srgb })
@@ -102,14 +103,34 @@ impl Session {
     pub fn sync_images(&mut self) {
         self.images.retain(|name, _| self.doc.resources.contains_key(name));
 
-        // Linked material packages are resources but cannot be decoded as images
-        let package_suffix = format!(".{}", texturecraft_formats::mcmat::MCRAFT_EXT);
+        let mut linked_packages = std::collections::HashSet::new();
+        let mut linked_images = std::collections::HashMap::new();
+        for layer in self.doc.project.layers.values() {
+            let LayerKind::Fill(Fill { link: Some(link), sources, .. }) = &layer.kind else { continue };
+
+            linked_packages.insert(link.package.as_str());
+            for source in sources.values() {
+                if let Source::Image { name, .. } = source {
+                    linked_images.entry(name.as_str()).and_modify(|size: &mut u32| *size = (*size).max(link.size)).or_insert(link.size);
+                }
+            }
+        }
+
         for (name, bytes) in &self.doc.resources {
-            if self.images.contains_key(name) || name.ends_with(&package_suffix) {
+            if self.images.contains_key(name) || linked_packages.contains(name.as_str()) {
                 continue;
             }
 
-            match texturecraft_formats::decode_image(bytes) {
+            // EXR may need a full float decode buffer even when encoded project bytes are small
+            let image = match linked_images.get(name.as_str()) {
+                Some(&size) if size > 0 && bytes.starts_with(EXR_SIGNATURE) => {
+                    let texels = (u64::from(size) * u64::from(size)).min(texturecraft_formats::MAX_RESOURCE_TEXELS);
+                    let decoder_bytes = texels * std::mem::size_of::<[f32; 4]>() as u64;
+                    texturecraft_formats::decode_cooked_image(bytes, [size; 2], decoder_bytes).or_else(|_| texturecraft_formats::decode_image(bytes))
+                }
+                _ => texturecraft_formats::decode_image(bytes),
+            };
+            match image {
                 Ok(image) => {
                     self.images.insert(name.clone(), decoded(image));
                 }
@@ -143,27 +164,57 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
 /// Read a regular image file within both the per-file cap and the caller's remaining byte budget
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_image_file(cmd: &str, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
+    read_resource_file(cmd, std::path::Path::new(path), max_bytes.min(MAX_BYTES as u64))
+}
 
-    let max_bytes = max_bytes.min(MAX_BYTES as u64);
-    let read_error = |error| bad(cmd, format!("cannot read {path}: {error}"));
-    let too_large = || bad(cmd, format!("{path} is too large (limit {max_bytes} bytes)"));
-    let metadata = std::fs::metadata(path).map_err(read_error)?;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn open_resource_file(cmd: &str, path: &std::path::Path) -> Result<std::fs::File> {
+    let display = path.display();
+    let read_error = |error| bad(cmd, format!("cannot read {display}: {error}"));
 
     // Pipes can block on open, and devices may never reach EOF
-    if !metadata.is_file() {
-        return Err(bad(cmd, format!("{path} is not a regular file")));
+    if !std::fs::metadata(path).map_err(read_error)?.is_file() {
+        return Err(bad(cmd, format!("{display} is not a regular file")));
     }
 
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        // Follow user-selected symlinks without waiting on a substituted pipe
+        let descriptor = open(path, OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty()).map_err(|error| read_error(error.into()))?;
+        std::fs::File::from(descriptor)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).map_err(read_error)?;
+
+    if !file.metadata().map_err(read_error)?.is_file() {
+        return Err(bad(cmd, format!("{display} is not a regular file")));
+    }
+
+    Ok(file)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_resource_file(cmd: &str, path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let display = path.display();
+    let read_error = |error| bad(cmd, format!("cannot read {display}: {error}"));
+    let too_large = || bad(cmd, format!("{display} is too large (limit {max_bytes} bytes)"));
+    let mut file = open_resource_file(cmd, path)?;
+    let metadata = file.metadata().map_err(read_error)?;
     if metadata.len() > max_bytes {
         return Err(too_large());
     }
 
-    // Bound the read even if the file grows after the metadata check
-    let file = std::fs::File::open(path).map_err(read_error)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1).read_to_end(&mut bytes).map_err(read_error)?;
-    if bytes.len() as u64 > max_bytes {
+    let mut bytes = Vec::new();
+    let capacity = usize::try_from(metadata.len()).map_err(|_| too_large())?;
+    bytes.try_reserve_exact(capacity).map_err(|error| bad(cmd, format!("cannot allocate {display}: {error}")))?;
+
+    // A growing file must not trigger allocations beyond the checked size
+    file.by_ref().take(metadata.len()).read_to_end(&mut bytes).map_err(read_error)?;
+    if file.read(&mut [0u8]).map_err(read_error)? != 0 {
         return Err(too_large());
     }
 

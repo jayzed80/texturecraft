@@ -196,6 +196,21 @@ fn a_mask_fill_added_with_tile_settings_keeps_them() {
 }
 
 #[test]
+fn a_new_procedural_mask_uses_scalar_scale_only_for_the_pattern() {
+    let mut session = session();
+    execute(&mut session, "layer.add.fill", &Value::Null).unwrap();
+    execute(&mut session, "mask.add.black", &Value::Null).unwrap();
+
+    let added = execute(&mut session, "effect.add.fill", &json!({"procedural": "Smooth fur", "scale": 3.0})).unwrap();
+
+    let effect = LayerId(added["effect"].as_u64().unwrap());
+    let (_, effect) = session.doc.project.effect(effect).unwrap();
+    let EffectKind::Fill { source: Source::Procedural { pattern, .. }, projection } = &effect.kind else { panic!("expected a procedural mask fill") };
+    assert_eq!(pattern.scale, 3.0);
+    assert_eq!(*projection, Projection::default(), "UV placement must not multiply pattern frequency a second time");
+}
+
+#[test]
 fn inspect_reports_the_tile_settings_and_a_patterns_resolution() {
     let mut session = session();
     tile_fill(&mut session);

@@ -731,49 +731,61 @@ fn with_ramp(channel: Channel, current: Option<&Source>, source: Option<Source>,
     Ok(Some(source))
 }
 
-/// The projection `p` asks for. Fields it does not give keep their values from `current` when
-/// that is of the same kind (or `p` names no kind), and the kind's defaults otherwise.
-pub(crate) fn projection_from(p: &Value, cmd: &str, current: Option<&Projection>) -> Result<Projection> {
-    let named = match strp(p, "projection") {
+/// Parse projection settings, retaining unspecified fields when the projection kind stays the same.
+pub(crate) fn projection_from(params: &Value, command: &str, current: Option<&Projection>) -> Result<Projection> {
+    projection_from_fields(params, command, current, true)
+}
+
+/// A procedural mask can assign the command's scale to its pattern instead of its projection.
+pub(crate) fn projection_from_fields(params: &Value, command: &str, current: Option<&Projection>, read_scale: bool) -> Result<Projection> {
+    const MIN_SCALE: f32 = 0.001;
+    const MAX_SCALE: f32 = 1000.0;
+    const MAX_OFFSET: f32 = 1000.0;
+    const DEFAULT_SHARPNESS: f32 = 8.0;
+    const MAX_SHARPNESS: f32 = 64.0;
+
+    let named = match strp(params, "projection") {
         None => None,
         Some("uv") => Some(Projection::default()),
-        Some("triplanar" | "tri-planar") => Some(Projection::Triplanar { scale: 1.0, sharpness: 8.0, offset: [0.0; 3] }),
+        Some("triplanar" | "tri-planar") => Some(Projection::Triplanar { scale: 1.0, sharpness: DEFAULT_SHARPNESS, offset: [0.0; 3] }),
         Some("planar") => Some(Projection::Planar { scale: 1.0, axis: 2, offset: [0.0; 3] }),
         Some("spherical") => Some(Projection::Spherical { scale: 1.0 }),
         Some("cylindrical") => Some(Projection::Cylindrical { scale: 1.0, axis: 1 }),
-        Some(other) => return Err(bad(cmd, format!("unknown projection `{other}`"))),
+        Some(other) => return Err(bad(command, format!("unknown projection `{other}`"))),
     };
-    let mut proj = match (named, current) {
-        (Some(n), Some(c)) if std::mem::discriminant(&n) == std::mem::discriminant(c) => c.clone(),
-        (Some(n), _) => n,
-        (None, c) => c.cloned().unwrap_or_default(),
+    let mut projection = match (named, current) {
+        (Some(named), Some(current)) if std::mem::discriminant(&named) == std::mem::discriminant(current) => current.clone(),
+        (Some(named), _) => named,
+        (None, current) => current.cloned().unwrap_or_default(),
     };
-    let scale = floats::<2>(p, "scale", 0.001, 1000.0);
-    let axis = u64p(p, "axis").map(|a| a.min(2) as u8);
-    match &mut proj {
-        Projection::Uv { scale: s, rotation, offset } => {
-            *s = scale.unwrap_or(*s);
-            *rotation = f32p(p, "rotation").map_or(*rotation, |r| r.rem_euclid(360.0));
-            *offset = floats(p, "offset", -1000.0, 1000.0).unwrap_or(*offset);
+
+    let new_scale = if read_scale { floats::<2>(params, "scale", MIN_SCALE, MAX_SCALE) } else { None };
+    let new_axis = u64p(params, "axis").map(|axis| axis.min(2) as u8);
+    match &mut projection {
+        Projection::Uv { scale, rotation, offset } => {
+            *scale = new_scale.unwrap_or(*scale);
+            *rotation = f32p(params, "rotation").map_or(*rotation, |degrees| degrees.rem_euclid(360.0));
+            *offset = floats(params, "offset", -MAX_OFFSET, MAX_OFFSET).unwrap_or(*offset);
         }
-        Projection::Triplanar { scale: s, sharpness, offset } => {
-            *s = scale.map_or(*s, |v| v[0]);
-            *sharpness = f32p(p, "sharpness").map_or(*sharpness, |v| v.clamp(1.0, 64.0));
-            *offset = floats(p, "offset", -1000.0, 1000.0).unwrap_or(*offset);
+        Projection::Triplanar { scale, sharpness, offset } => {
+            *scale = new_scale.map_or(*scale, |axes| axes[0]);
+            *sharpness = f32p(params, "sharpness").map_or(*sharpness, |value| value.clamp(1.0, MAX_SHARPNESS));
+            *offset = floats(params, "offset", -MAX_OFFSET, MAX_OFFSET).unwrap_or(*offset);
         }
-        Projection::Planar { scale: s, axis: a, offset } => {
-            *s = scale.map_or(*s, |v| v[0]);
-            *a = axis.unwrap_or(*a);
-            *offset = floats(p, "offset", -1000.0, 1000.0).unwrap_or(*offset);
+        Projection::Planar { scale, axis, offset } => {
+            *scale = new_scale.map_or(*scale, |axes| axes[0]);
+            *axis = new_axis.unwrap_or(*axis);
+            *offset = floats(params, "offset", -MAX_OFFSET, MAX_OFFSET).unwrap_or(*offset);
         }
-        Projection::Spherical { scale: s } => *s = scale.map_or(*s, |v| v[0]),
-        Projection::Cylindrical { scale: s, axis: a } => {
-            *s = scale.map_or(*s, |v| v[0]);
-            *a = axis.unwrap_or(*a);
+        Projection::Spherical { scale } => *scale = new_scale.map_or(*scale, |axes| axes[0]),
+        Projection::Cylindrical { scale, axis } => {
+            *scale = new_scale.map_or(*scale, |axes| axes[0]);
+            *axis = new_axis.unwrap_or(*axis);
         }
         Projection::Decal(_) => {}
     }
-    Ok(proj)
+
+    Ok(projection)
 }
 
 /// `key` as `N` finite numbers clamped to `lo..=hi`: an array of `N`, or one number for all.

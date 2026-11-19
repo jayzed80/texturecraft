@@ -290,12 +290,50 @@ pub enum ProceduralKind {
     Pores,
     /// Sharp-edged paint chips.
     Chips,
+    /// Hexagon tiles with joints (0 = joint).
+    HexagonTiles,
+    /// Rows of overlapping fan-shaped waves, each a set of concentric arcs.
+    WaveScales,
+    /// Herringbone planks with gaps and grain (0 = gap).
+    HerringbonePlanks,
+    /// A halftone screen: dots on a diagonal grid, growing and shrinking across the pattern.
+    HalftoneDots,
+    /// Raised diamonds of concentric rings on a twill ground.
+    DiamondBrocade,
+    /// Truchet tiles: quarter-circle arcs that join into winding paths.
+    TruchetArcs,
+    /// Long smooth locks of fur, shaded like a height map.
+    SmoothFur,
+    /// Crowded soft cloudlets over a dark sky.
+    MackerelSky,
+    /// Warped clouds crossed by fine strands.
+    Billow,
+    /// Overlapping reptile scales, domed and lit from above.
+    ReptileScales,
+    /// Young bark: tall plates parted by wandering furrows (0 = furrow).
+    Bark,
+    /// Rotting flesh: soft lobes, veins and patches of decay.
+    Flesh,
+    /// Four flat tones of interlocking blotches, for camouflage.
+    Camouflage,
+    /// Stockinette knit: V-shaped stitches of twisted yarn.
+    Knit,
+    /// A basket weave: threads in pairs, alternately across and down.
+    BasketWeave,
+    /// A goose-eye twill: diagonal ribs that turn back into small diamonds.
+    GooseEye,
+    /// Raw silk with slubs: threads that swell here and there.
+    SlubSilk,
+    /// Strip flooring: long boards with staggered butt joints (0 = gap).
+    StripFlooring,
+    /// Wood grain that bends around knots.
+    KnottyWood,
     /// Shapes laid out in a grid of tiles, with the settings in [`Procedural::tile`]
     TileGenerator,
 }
 
 impl ProceduralKind {
-    pub const ALL: [ProceduralKind; 24] = [
+    pub const ALL: [ProceduralKind; 43] = [
         ProceduralKind::Clouds,
         ProceduralKind::Perlin,
         ProceduralKind::Noise,
@@ -319,8 +357,28 @@ impl ProceduralKind {
         ProceduralKind::Smudges,
         ProceduralKind::Pores,
         ProceduralKind::Chips,
+        ProceduralKind::HexagonTiles,
+        ProceduralKind::WaveScales,
+        ProceduralKind::HerringbonePlanks,
+        ProceduralKind::HalftoneDots,
+        ProceduralKind::DiamondBrocade,
+        ProceduralKind::TruchetArcs,
+        ProceduralKind::SmoothFur,
+        ProceduralKind::MackerelSky,
+        ProceduralKind::Billow,
+        ProceduralKind::ReptileScales,
+        ProceduralKind::Bark,
+        ProceduralKind::Flesh,
+        ProceduralKind::Camouflage,
+        ProceduralKind::Knit,
+        ProceduralKind::BasketWeave,
+        ProceduralKind::GooseEye,
+        ProceduralKind::SlubSilk,
+        ProceduralKind::StripFlooring,
+        ProceduralKind::KnottyWood,
         ProceduralKind::TileGenerator,
     ];
+
     pub fn label(self) -> &'static str {
         match self {
             ProceduralKind::Clouds => "Clouds",
@@ -346,12 +404,34 @@ impl ProceduralKind {
             ProceduralKind::Smudges => "Fingerprints",
             ProceduralKind::Pores => "Pores",
             ProceduralKind::Chips => "Paint chips",
+            ProceduralKind::HexagonTiles => "Hexagon tiles",
+            ProceduralKind::WaveScales => "Wave scales",
+            ProceduralKind::HerringbonePlanks => "Herringbone planks",
+            ProceduralKind::HalftoneDots => "Halftone dots",
+            ProceduralKind::DiamondBrocade => "Diamond brocade",
+            ProceduralKind::TruchetArcs => "Truchet arcs",
+            ProceduralKind::SmoothFur => "Smooth fur",
+            ProceduralKind::MackerelSky => "Mackerel sky",
+            ProceduralKind::Billow => "Soft billow",
+            ProceduralKind::ReptileScales => "Reptile scales",
+            ProceduralKind::Bark => "Young bark",
+            ProceduralKind::Flesh => "Rotting flesh",
+            ProceduralKind::Camouflage => "Camouflage",
+            ProceduralKind::Knit => "Knit stitches",
+            ProceduralKind::BasketWeave => "Basket weave",
+            ProceduralKind::GooseEye => "Goose-eye twill",
+            ProceduralKind::SlubSilk => "Slub silk",
+            ProceduralKind::StripFlooring => "Strip flooring",
+            ProceduralKind::KnottyWood => "Knotty wood",
             ProceduralKind::TileGenerator => "Tile Generator",
         }
     }
-    pub fn parse(s: &str) -> Option<ProceduralKind> {
-        let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-'], "");
-        ProceduralKind::ALL.into_iter().find(|k| norm(k.label()) == norm(s) || norm(&format!("{k:?}")) == norm(s))
+
+    pub fn parse(name: &str) -> Option<ProceduralKind> {
+        let normalize = |text: &str| text.to_ascii_lowercase().replace([' ', '_', '-'], "");
+        let name = normalize(name);
+
+        ProceduralKind::ALL.into_iter().find(|kind| normalize(kind.label()) == name || normalize(&format!("{kind:?}")) == name)
     }
 }
 
@@ -1520,11 +1600,20 @@ mod tests {
 
     #[test]
     fn generator_kinds_parse() {
-        for k in GeneratorKind::ALL {
-            assert_eq!(GeneratorKind::parse(&format!("{k:?}")), Some(k));
+        for kind in GeneratorKind::ALL {
+            assert_eq!(GeneratorKind::parse(&format!("{kind:?}")), Some(kind));
         }
-        for k in ProceduralKind::ALL {
-            assert_eq!(ProceduralKind::parse(k.label()), Some(k));
+    }
+
+    #[test]
+    fn procedural_kinds_parse_labels_and_saved_names() {
+        for kind in ProceduralKind::ALL {
+            let saved_name = format!("{kind:?}");
+
+            assert_eq!(ProceduralKind::parse(kind.label()), Some(kind));
+            assert_eq!(ProceduralKind::parse(&saved_name), Some(kind));
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::Value::String(saved_name));
+            assert_eq!(serde_json::from_value::<ProceduralKind>(serde_json::to_value(kind).unwrap()).unwrap(), kind);
         }
     }
 }

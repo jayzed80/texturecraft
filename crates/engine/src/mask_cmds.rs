@@ -7,7 +7,7 @@ use texturecraft_core::{
 };
 
 use crate::commands::{CommandSpec, always, bad, blend_param, boolp, channel_param, color_param, f32p, has_layer, layer_param, strp, u64p};
-use crate::layer_cmds::projection_from;
+use crate::layer_cmds::{projection_from, projection_from_fields};
 use crate::session::StackTarget;
 use crate::{EngineError, Result, Session, cmd};
 
@@ -295,7 +295,6 @@ fn image_source(session: &Session, command: &str, name: &str) -> Result<Source> 
 
 fn add_fill(session: &mut Session, params: &Value) -> Result<Value> {
     const CMD: &str = "effect.add.fill";
-    let projection = projection_from(params, CMD, None)?;
     let blend = blend_param(CMD, params, "blend")?.unwrap_or(BlendMode::Normal);
     let layer = layer_param(session, CMD, params)?;
 
@@ -305,33 +304,30 @@ fn add_fill(session: &mut Session, params: &Value) -> Result<Value> {
             fill.sources = session.doc.project.layer(layer)?.channels.keys().map(|channel| (*channel, Source::uniform_of(*channel))).collect();
         }
 
-        fill.projection = projection;
+        fill.projection = projection_from(params, CMD, None)?;
         return push_effect(session, params, EffectKind::Material(fill), blend);
     }
 
-    if let Some(anchor) = u64p(params, "anchor") {
+    let source = if let Some(anchor) = u64p(params, "anchor") {
         let channel = channel_param(CMD, params, "anchorChannel")?.unwrap_or(Channel::Height);
         let reader = session.doc.project.mask_owner(layer);
-        let source = anchor_source(session, CMD, reader, LayerId(anchor), channel)?;
-        return push_effect(session, params, EffectKind::Fill { source, projection }, blend);
-    }
+        anchor_source(session, CMD, reader, LayerId(anchor), channel)?
+    } else if let Some(name) = strp(params, "image") {
+        image_source(session, CMD, name)?
+    } else if let Some(name) = strp(params, "procedural") {
+        let kind = ProceduralKind::parse(name).ok_or_else(|| bad(CMD, format!("unknown procedural `{name}`")))?;
+        let mut pattern = Procedural::new(kind);
+        crate::procedural_params::pattern_basics_from(params, &mut pattern);
+        crate::procedural_params::pattern_settings_from(CMD, params, &mut pattern)?;
 
-    if let Some(name) = strp(params, "image") {
-        let source = image_source(session, CMD, name)?;
-        return push_effect(session, params, EffectKind::Fill { source, projection }, blend);
-    }
-
-    let source = match strp(params, "procedural") {
-        Some(name) => {
-            let kind = ProceduralKind::parse(name).ok_or_else(|| bad(CMD, format!("unknown procedural `{name}`")))?;
-            let mut pattern = Procedural::new(kind);
-            crate::procedural_params::pattern_basics_from(params, &mut pattern);
-            crate::procedural_params::pattern_settings_from(CMD, params, &mut pattern)?;
-
-            Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }
-        }
-        None => Source::Uniform([f32p(params, "value").unwrap_or(1.0).clamp(0.0, 1.0); 3]),
+        Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3], ramp: Vec::new() }
+    } else {
+        Source::Uniform([f32p(params, "value").unwrap_or(1.0).clamp(0.0, 1.0); 3])
     };
+
+    // A scalar controls pattern frequency, while a two-axis scale places the new mask
+    let pattern_scale = matches!(source, Source::Procedural { .. }) && params.get("scale").is_some_and(Value::is_number);
+    let projection = projection_from_fields(params, CMD, None, !pattern_scale)?;
 
     push_effect(session, params, EffectKind::Fill { source, projection }, blend)
 }
@@ -688,16 +684,9 @@ fn set(session: &mut Session, params: &Value) -> Result<Value> {
                     *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
 
-                // While the fill reads a pattern, `scale` is the pattern's and leaves the projection alone
-                let mut placement = params.clone();
-                if matches!(source, Source::Procedural { .. })
-                    && let Some(fields) = placement.as_object_mut()
-                {
-                    fields.remove("scale");
-                }
-
-                // Preserve projection fields that the edit does not supply
-                *projection = projection_from(&placement, CMD, Some(&*projection))?;
+                // Pattern edits keep the mask's existing projection scale
+                let read_scale = !matches!(source, Source::Procedural { .. });
+                *projection = projection_from_fields(params, CMD, Some(projection), read_scale)?;
             }
             EffectKind::ColorSelection { colors, tolerance } => crate::color_selection_cmds::apply_params(params, colors, tolerance)?,
             EffectKind::Compare { tolerance, .. } => {

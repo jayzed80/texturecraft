@@ -81,10 +81,12 @@ impl Session {
 
     /// The smart material file holding `mini` (a document from [`one_set_document`]) and the images layer `root` of it uses.
     pub(crate) fn file_bytes(&self, mini: Document, root: LayerId) -> Result<Vec<u8>> {
+        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
         let mut used = Vec::new();
         images_used(&mini.project, root, &mut used, 0);
-        let resources = used.iter().filter_map(|n| self.doc.resources.get(n).map(|b| (n.clone(), b.as_ref().clone()))).collect();
-        let pf = texturecraft_formats::ProjectFile {
+        let resources = used.into_iter().filter_map(|name| self.doc.resources.get(&name).map(|bytes| (name, Arc::clone(bytes)))).collect();
+
+        let snapshot = texturecraft_formats::ProjectFile {
             project: mini.project,
             pixels: mini.pixels,
             baked: BTreeMap::new(),
@@ -96,7 +98,7 @@ impl Session {
             resources,
             warnings: Vec::new(),
         };
-        texturecraft_formats::save_project_bytes(&pf).map_err(fe)
+        reservation.save_bytes(&snapshot).map_err(fe)
     }
 
     /// Add a smart material file above the selection (one undo step). Returns the new layer.
@@ -111,23 +113,26 @@ impl Session {
             return self.add_linked_material_bytes_at(bytes, place);
         }
 
-        let pf = texturecraft_formats::load_project_bytes(bytes).map_err(fe)?;
-        let root = pf
+        self.add_smart_material_project(texturecraft_formats::load_project_bytes(bytes).map_err(fe)?, place)
+    }
+
+    fn add_smart_material_project(&mut self, project_file: texturecraft_formats::ProjectFile, place: Place) -> Result<LayerId> {
+        let root = project_file
             .project
             .texture_sets
             .first()
             .and_then(|t| t.stack.last().copied())
             .ok_or_else(|| EngineError::Other("the smart material file has no layer".into()))?;
-        let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        let src = Document { bake_paint: BTreeMap::new(), project: pf.project, pixels: pf.pixels, baked: BTreeMap::new(), resources: resources.clone() };
+        let resources: BTreeMap<String, Arc<Vec<u8>>> = project_file.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        let source = Document { bake_paint: BTreeMap::new(), project: project_file.project, pixels: project_file.pixels, baked: BTreeMap::new(), resources };
         let id = self.edit("Add smart material", |s| {
-            for (k, v) in &resources {
-                s.doc.resources.entry(k.clone()).or_insert_with(|| v.clone());
+            for (name, bytes) in &source.resources {
+                s.doc.resources.entry(name.clone()).or_insert_with(|| Arc::clone(bytes));
             }
             let ts = s.ts();
             let sel = s.selected_layer();
             let inside = sel.and_then(|l| s.doc.project.layer(l).ok()).is_some_and(|l| l.is_group());
-            let id = crate::layer_ops::copy_tree(&src, root, &mut s.doc, ts, sel, inside, 0)?;
+            let id = crate::layer_ops::copy_tree(&source, root, &mut s.doc, ts, sel, inside, 0)?;
             place.apply(s, id)?;
             s.select_one(ts, id);
             s.target = StackTarget::Content;
@@ -161,8 +166,23 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn load(s: &mut Session, p: &Value) -> Result<Value> {
     let path = strp(p, "path").ok_or_else(|| bad("material.load", "`path` is required"))?;
-    let bytes = std::fs::read(path).map_err(|e| bad("material.load", format!("cannot read {path}: {e}")))?;
-    let id = s.add_smart_material_bytes_at(&bytes, Place::from_params(p))?;
+    let source = std::path::Path::new(path);
+    let place = Place::from_params(p);
+    let project = if crate::link_cmds::is_link_file(source) {
+        None
+    } else {
+        let file = crate::resource_cmds::open_resource_file("material.load", source)?;
+        texturecraft_formats::project_file::load_smart_material_project(file).map_err(fe)?
+    };
+
+    let id = if let Some(project) = project {
+        s.add_smart_material_project(project, place)?
+    } else {
+        let set = s.ts();
+        let resolution = s.doc.project.texture_set(set)?.resolution;
+        let (source, cooked) = crate::link_cmds::cook_link_file(source, resolution, s.baked(set).cloned(), s.link_memory_budget(), Arc::default())?;
+        s.add_cooked_material(&cooked, source.package, source.source_ext, place)?
+    };
     Ok(json!({ "layer": id.0 }))
 }
 
