@@ -20,6 +20,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::TextureCraftApp;
+use crate::state::Prefs;
 
 pub struct ControlRequest {
     pub method: String,
@@ -47,7 +48,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
         if r.method == "ui.screenshot" {
-            // Replies when the next frame has been captured.
+            // Reply after the next frame is captured
             let reply = r.reply;
             let repaint = ctx.clone();
             let callback = egui::ScreenshotCallback::new(move |img| {
@@ -61,6 +62,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ctx.request_repaint();
             continue;
         }
+
         let reply = handle(app, ctx, &r.method, &r.params);
         let _ = r.reply.send(reply);
         ctx.request_repaint();
@@ -71,6 +73,43 @@ pub(crate) fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec
     let img = craft_image_codecs::Image::from_u8(w, h, craft_image_codecs::ChannelLayout::Rgba, rgba).ok()?;
     let png = craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &Default::default()).ok()?;
     Some((w, h, png))
+}
+
+fn refresh_draft_preferences(draft: &mut Prefs, previous: &Prefs, current: &Prefs) {
+    // Exhaustive destructuring requires reconciliation for every new preference
+    macro_rules! refresh_fields {
+        ($($field:ident),+ $(,)?) => {
+            let Prefs { $($field),+ } = current;
+
+            $(
+                if &previous.$field != $field {
+                    draft.$field.clone_from($field);
+                }
+            )+
+        };
+    }
+
+    refresh_fields!(
+        ui_scale,
+        autosave_minutes,
+        language,
+        viewport_texture,
+        brightness,
+        accent,
+        system_title_bar,
+        data_folder,
+        reserved_cores,
+        project_open_limit_gib,
+        save_ram_percent,
+        work_threads,
+        rotation_speed,
+        zoom_speed,
+        zoom_inverse,
+        wheel_speed,
+        wheel_inverse,
+        gpu_raytracing,
+        libraries,
+    );
 }
 
 pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, params: &Value) -> Value {
@@ -218,9 +257,33 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, para
                 }
             }
 
-            match serde_json::from_value(current_state) {
-                Ok(ui) => {
+            match serde_json::from_value::<crate::UiState>(current_state) {
+                Ok(mut ui) => {
+                    let previous_autosave_minutes = app.ui.prefs.autosave_minutes;
+                    if ui.prefs.libraries != app.ui.prefs.libraries {
+                        app.library = None;
+                    }
+
+                    // Pending dialogs and editor text do not appear in the serialized state
+                    if params.get("windows").is_none() {
+                        ui.windows = std::mem::take(&mut app.ui.windows);
+                    } else {
+                        ui.windows.mesh_export_options = app.ui.windows.mesh_export_options;
+                        if ui.windows.settings {
+                            ui.windows.settings_draft = app.ui.windows.settings_draft.take();
+                        }
+                    }
+                    ui.bake_preset_name = std::mem::take(&mut app.ui.bake_preset_name);
+
+                    // Live changes take precedence only for the fields they affect
+                    if params.get("prefs").is_some()
+                        && let Some(draft) = &mut ui.windows.settings_draft
+                    {
+                        refresh_draft_preferences(&mut draft.prefs, &app.ui.prefs, &ui.prefs);
+                    }
+
                     app.ui = ui;
+                    app.reschedule_autosave_if_changed(previous_autosave_minutes);
                     app.ui.prefs.apply_resource_limits();
                     ok(Value::Null)
                 }

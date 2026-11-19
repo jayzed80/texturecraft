@@ -55,6 +55,39 @@ The relevant implementations are [layer rows, menus and fill/brush editors](../c
 [display settings](../crates/core/src/project.rs), and
 [smart-mask commands](../crates/engine/src/smart_masks.rs).
 
+## Side panels ([#642](https://github.com/storytold/texturecraft/issues/642))
+
+**UI + tests** (`crates/ui-egui/tests/it/side_panels.rs`). The right bar lists Export, Log,
+Display Settings, Shader Settings and History in the reference order (Texture Set Settings follows
+when it is not docked). Each opens a popup beside the bar with its title in capitals, an *Undock*
+button that turns it into a floating window, and *Close*. A floating rail panel has a *Dock* button
+that closes it back onto the bar; the float is saved with the UI state.
+
+- **Export:** SEND TO lists three targets and a Configure button, all greyed with "Not available
+  yet". The reference names other products there; TextureCraft says *Export to image editor*,
+  *Send to compositing app* and *Send to 3D staging app*. EXPORT has *Export Mesh...* (the
+  *Mesh Export Options* prompt, then the file choice) and *Export Textures...* (the Export textures
+  window: *Global settings* above the texture sets, *General Export Parameters*, *Export USD asset*
+  and *Export shaders parameters* greyed, *Include all*, *Save settings* and "N textures selected
+  for export"). The prompt's *With displacement/tessellation* choice and both option checkboxes are
+  greyed; TextureCraft exports the mesh as it is.
+- **Log:** *General* and *Assets* tabs. Messages are sorted by how they begin (see
+  `log_panel::ASSET_PREFIXES`); the status bar still shows the latest message of either.
+- **Display Settings:** *View mode* above the section tabs; Environment settings (Environment Map,
+  Opacity, Exposure (EV), Blur, Rotation; *Override environment map color space* with *Auto*,
+  *Environment Alignment* *World*), Shadows (*Shadows*; *Computation mode* *Lightweight* and
+  *Shadows opacity* 90 greyed) and Camera settings (*Preset* and *Restore* work on the saved
+  cameras). Post effects and Viewer settings keep TextureCraft's own controls. The reference's
+  fifth tab is not shown in the screenshot and is left out. Colour management stays greyed.
+- **Shader Settings:** greyed *Undo*, *Redo* and *Instance name* (*Main shader*); the *open-pbr*
+  button opens the shader choice with the reference's search (*u:shader*) and its 17 entries as
+  the screenshot shows them, names cut short included. Only *open-pbr* works. Shader parameters
+  (Base Surface, Specular, Transmission, Subsurface) and Displacement & tessellation (Enable,
+  Displacement, Tessellation, *Restore defaults*) follow the reference; rows TextureCraft cannot
+  drive are greyed. Its own Metallic Roughness / Specular Glossiness model choice, Scatter color and
+  Parallax occlusion stay in the fitting sections. *Quality*, *Horizon fade* and the cut-off
+  "Enable d..." row are hidden in the reference screenshot and are left out.
+
 ## Partial areas
 
 | ID | Area | Observed limit | Next check |
@@ -62,6 +95,11 @@ The relevant implementations are [layer rows, menus and fill/brush editors](../c
 | UI-12 | Generator depth and property coverage | **UI + source.** The picker contains seven kinds. Switching to Position, changing Global balance and duplicating the effect worked. Shared global adjustments, resolution and input slots already exist; that does not establish the richer generator/control inventory in [#374](https://github.com/storytold/texturecraft/issues/374) | Audit each generator's inputs, micro-detail behavior and controls against the reference; do not count seven shared implementations as equivalent to its whole catalog |
 | UI-13 | Narrow workspace readability | **UI.** At 1280 × 800 the app rendered, both views stayed visible and the toolbar exposed scroll arrows. Layer names/types became heavily truncated, the layer toolbar wrapped, and Properties needed scrolling. This was not an input-failure or docking-persistence test | Repeat the editing tasks at smaller sizes, widen/rearrange panels, check full-name tooltips and keyboard access, and retain the layout after restart. Since then: the Layers toolbar stays on one row at 1280 × 800 (its channel box shrinks), and a cut-short layer name or type shows in full on hover. Properties scrolling and restart persistence are unchanged |
 | UI-14 | Assets panel filters | **UI + source.** The type dropdown lists the reference entries in its order, Fonts and Show all included. Saved searches and Filter by path are separate scrollable panes with a divider that supports pointer and keyboard resizing and saves its position with the UI state ([#640](https://github.com/storytold/texturecraft/issues/640)). Fonts, the built-in saved searches Favorites, 3D Assets and Flattened layers, and the System fonts and User fonts libraries are listed but greyed with "Not available yet" | Give fonts, favorites, 3D assets and flattened layers real assets, then enable those rows and check that each one filters the grid |
+| UI-15 | Edit > Settings ([#637](https://github.com/storytold/texturecraft/issues/637)) | **Source + headless UI tests.** The window has the reference's General, Shortcuts and Libraries pages with OK and Cancel, and the General sections in its order (no Privacy section: TextureCraft sends no usage data). Language (with Default (System Language)), the camera rotation, zoom and wheel speeds with Inverse direction, Enable GPU raytracing, the Shortcuts page and adding or removing library locations work. Show keyboard helper, Show world axes, Background color, Only display the selected material when painting, Viewport Scaling, Default UV scale for materials, simplified thumbnails, the other baking options, the preview cache and shader, the temporary cache directory, sparse virtual texture and the IRAY HARDWARE choices are shown disabled with "Not available yet". A location's Default choice is fixed to your_assets. TextureCraft's own settings (appearance, viewport textures, resources, autosave, folders) follow the reference sections | Run the window in the native app; wire each disabled control as its function lands |
+
+Bake workflow (issue [#651](https://github.com/storytold/texturecraft/issues/651)): Mesh Map Bakers
+has a Presets menu (save, load, delete named bake settings; Apply to All Texture Sets) and a finished
+bake shows a summary toast (maps baked, time, failed sets, with a link to the Log on failure).
 
 File > Import resources ([#638](https://github.com/storytold/texturecraft/issues/638)) queues
 images and materials for the open project. Images support a name prefix and a usage. Texture
@@ -85,7 +123,7 @@ list, not a feature-completion denominator.
 | F02 Paint in 3D | UI | Pass | A mouse drag produced a visible stroke in 3D and its UV representation; inspection showed a Paint stroke undo step and painted tiles |
 | F03 Paint in 2D | UI | Pass | A separate UV-view drag increased painted tiles from 7 to 21 per active channel and changed the visible image |
 | F04 Undo and redo | UI | Pass | Ctrl+Z restored 7 tiles and history depth 2; Ctrl+Y restored 21 tiles and depth 3 |
-| F05 View switching | UI | Pass | F2 selected Only3D, F3 Only2D and F1 Split; the screenshots changed accordingly |
+| F05 View switching | UI | Pass | F2 selected Only3D, F3 Only2D and F1 Split; the screenshots changed accordingly. F4 (Swap 3D/2D) puts 2D on the left and 3D on the right |
 | F06 Brush gesture | UI | Pass | Ctrl+right-drag changed size from 8 to about 12.94 and hardness from 50 to about 38. This also demonstrates that diagonal movement changes both parameters; pen precision was not tested |
 | F07 Shelf search and material application | UI | Pass | Searching for car and dragging Car Paint onto the mesh added a red fill layer and an Add Car Paint history step |
 | F08 Fill layer and black mask | UI | Pass | Layer toolbar added a fill; the layer-name context menu added a black mask and selected the mask target |
@@ -137,3 +175,11 @@ fidelity. The new `.spp` reader is a future goal, not a tested capability.
 
 No implementation fixes were made in this assessment. The build from the earlier pass was
 reused; the full Rust tests, clippy, wasm and other operating-system builds were not rerun.
+
+## Camera and view (2026-11-18)
+
+Closes the camera gaps of [#649](https://github.com/storytold/texturecraft/issues/649):
+constrained / free (trackball) rotation, the "Camera snap rotate" commands next to the
+Alt+Shift+left drag (which already existed), bindable next / previous saved camera (the
+Ctrl+1 ... Ctrl+9 slots stay), and the "Normal+height+mesh" entry of the view picker.
+Free rotation uses the same Alt+left drag (and right drag) as the constrained one.

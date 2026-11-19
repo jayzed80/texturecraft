@@ -134,7 +134,7 @@ impl Session {
                 Ok(image) => {
                     self.images.insert(name.clone(), decoded(image));
                 }
-                Err(error) => self.log.push(format!("resource {name}: {error}")),
+                Err(error) => self.log.warn(format!("resource {name}: {error}")),
             }
         }
     }

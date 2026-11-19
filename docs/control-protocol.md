@@ -86,6 +86,12 @@ before the edit is applied as one undo step. `model` still replaces the complete
 when combined, `patch` follows `model`, then the flat command parameters apply. Omitting `ts`
 still targets the active set for scripts that need individual control.
 
+Bake presets are saved settings in the UI state (Mesh Map Bakers > Presets). Loading one is
+`bake.settings {ts: <index>, model: <the preset's settings>, preserveEnabled: true, preset: true}`; Apply to All
+Texture Sets is the same with `ts: "all"` and the active set's `model`. Both are one undo step.
+When a bake started in the app ends, a toast counts the new maps and failed sets, and shows the
+elapsed time. On failure, the toast can open the Log. The session log gets `Bake finished: N maps in T` and `Bake of texture set N failed: <error>`.
+
 The bake texture-set list shows visibility eyes and expandable UV tile rows. Visibility affects
 the viewport independently of bake inclusion. Its resolution menus edit the texture-set size
 (`textureSet.resolution`) and individual tile overrides (`textureSet.tile.resolution`), independently
@@ -155,11 +161,12 @@ keeps its state in a throwaway file.
 | `session.inspect` | | project, mesh, texture sets, layer stack, tool, camera, display, history |
 | `ui.inspect` | | UI state, viewport rect, fps, bake progress (`baking`, 0..1), the running bake's stage (`bakeStatus`, e.g. "Baking Ambient Occlusion (2/4)") and live preview (`bakePreview`, see *Live bake preview*), toasts, `titleBar` (who draws the title bar this run: `app`, `integrated` on macOS, or `system`) |
 | `ui.menu.list` | | the menu catalog: `{menu, submenu, label, id, shortcut, implemented, enabled}` |
-| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name |
+| `ui.menu.invoke` | `{id}` | behaves like a menu click (may open a window; `ui.resetUi` opens its question; `file.exportMesh` opens the Mesh Export Options prompt, whose Export asks for the file; `ui.view.export` opens the right bar's Export panel). `{"id": "ui.layout.apply", "name": "<layout>"}` switches to a panel layout saved under Window > Layouts (panels only; mode, zoom and wireframes stay) and errors when no layout has that name. `{"id": "ui.layout.swap"}` swaps the 3D and 2D views of the split layout (F4) |
+| `ui.menu.invoke` ids `ui.help.releaseNotes`, `ui.help.exportLog` | `{id}` | Help > Release notes... opens the releases page in the browser; Help > Export log... exports the session log with each entry’s recorded UTC time and severity (a save dialog on desktop, a download on the web) |
 | `ui.reset` | | resets the panels, view layout, zoom and every other view setting at once, without the question the Reset UI menu item asks; settings and shortcuts stay |
 | `ui.bake.start` | `{ts?: index \| [indices]}` (default: the sets ticked in Bake mode) | Opens Bake mode and bakes in the background like the Bake button: the 3D view shows the maps landing on the model as they finish (see *Live bake preview*). → the `bake.preview` state. Errors when a bake is already running |
 | `ui.bake.cancel` | | Stops the running bake; the set being baked keeps the maps it had, sets already finished stay applied, and the previous view mode comes back |
-| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History` and `Log`; `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds) | `null` |
+| `ui.set` | fields of the UI state, e.g. `{"layout": "Only3D"}`; `dock` is the panel layout, a craft-ui docking `Workspace` (`{version, layout: {root, floating}, hidden}`; `root` is a tree of `Split`, `Tabs` and `Stack` nodes over the panels `Viewport`, `Assets`, `TextureSetList`, `Layers`, `TextureSetSettings`, `Properties`, `Display`, `Shader`, `History`, `Log` and `Export` (a floating window holding one right-bar panel is that panel undocked); `hidden` lists where each closed panel was, so reopening it puts it back; a layout that does not read or has no docked `Viewport` becomes the default), `prefs` the settings (`{"language": "ja", "viewport_texture": 1, "brightness": "light", "accent": "blue"}`; missing fields take their defaults; `brightness` is `dark`, `mediumDark` (default), `mediumLight` or `light`, `accent` `copper` (default), `coral`, `blue`, `violet`, `green`, `amber` or `pink`, applied on the next frame; `system_title_bar` `true` has the system draw the title bar from the next start), `keymap` the custom shortcuts (`{"file.save": "F5"}`, `""` unbinds), `log_channel` the Log panel's tab (`General` or `Assets`) | `null` |
 | `viewport.screenshot` | `{view?: "3d" \| "2d"}` | `{width, height, png}` (PNG, base64) |
 | `ui.screenshot` | | `{width, height, png}` of the whole window, after the next frame |
 | `ui.resize` | `{width, height}` | Sets the window's inner size in points (640–7680), leaving maximized state; for recordings and screenshots at a fixed size |
@@ -240,6 +247,15 @@ of `prefs.reserved_cores` and `prefs.save_ram_percent` for saving.
 Settings bounds the reserved-core input to the available logical CPU count and shows the estimated
 save budget in GiB beside the RAM percentage. The readout refreshes once a second from currently
 available RAM; a save calculates its budget when it starts.
+
+Other preferences set through `ui.set {"prefs": {...}}`: `language` (`""` follows the system
+language), `work_threads` (worker threads for painting, baking and export; 0 uses every logical
+CPU; read at startup), `rotation_speed` (default 2), `zoom_speed` and `wheel_speed` (default 1,
+each from 0.1 to 10) with `zoom_inverse` and `wheel_inverse`, `gpu_raytracing` (false keeps bake
+rays on the CPU) and `libraries` (the folders the shelf scans for saved smart materials and masks).
+For example, the `libraries` field can contain `[{"name": "Studio", "path": "/assets/studio"}]`.
+Use an absolute path on the host running TextureCraft. To change one preference, read `state.prefs`
+with `ui.inspect`, update that field and send the full `prefs` object to `ui.set`.
 
 ## MCP server
 
@@ -496,9 +512,27 @@ frames the whole mesh. Both return the camera like `camera.get`.
 `camera.view {view}` looks at the mesh from one side (`front` from +Z, `back`, `left` from -X,
 `right`, `top` and `bottom` at the orbit's ±89° pitch limit) and frames it; the projection stays.
 `camera.view.front` … `camera.view.bottom` do the same without params (Viewport menu, no default
-shortcut, bindable in Settings ▸ Keyboard). `camera.perspective` (F5) and `camera.orthographic` (F6)
+shortcut, bindable in Settings ▸ Shortcuts). `camera.perspective` (F5) and `camera.orthographic` (F6)
 change only the projection; position and rotation stay. None of them is an undo step. In the 3D
 view, Alt+Shift+left drag orbits in 90° steps.
+
+`camera.rotation {mode: constrained|free}` (or `camera.rotation.constrained` / `camera.rotation.free`,
+Viewport menu and the rotation dropdown of the top bar) picks the orbit: constrained (the default) keeps
+the horizon level and stops at the poles; free is a trackball that turns the camera about its own axes,
+so the model can be turned over and rolled. `camera.get` shows it as `rotation`; `camera.set` takes
+`rotation` too. Switching keeps the direction of view; going back to constrained drops the roll.
+Views saved in free mode restore their roll while free rotation is active. Older cameras and cameras
+saved in constrained mode restore from yaw and pitch. Fixed views and `camera.set` yaw/pitch put a
+free camera level. `camera.snapRotate {yaw?, pitch?}`
+(whole 90° steps; the angles first go to the nearest step) is the command behind the Alt+Shift+left drag
+("Camera snap rotate"); `camera.snapRotate.left|right|up|down` are its menu forms. `camera.next` and
+`camera.previous` go to the next or previous saved camera (wrapping; from a view that is no saved
+camera, the first or the last). The commands have no default keys and are bindable in Settings ▸ Shortcuts.
+None is an undo step.
+
+`viewport.view {mode: "normalHeightMesh"}` is the combined "Normal+height+mesh" view: the surface normal
+the shading uses (mesh normal, Height channel slope and Normal channel), unlit; the 2D view shows its
+tangent-space form.
 
 ## MaterialCraft materials
 

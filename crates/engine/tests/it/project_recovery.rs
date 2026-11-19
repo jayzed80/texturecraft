@@ -29,7 +29,7 @@ fn recovered_project_opens_with_a_warning_in_the_session_log() {
     let path = std::env::temp_dir().join(format!("texturecraft-recovery-{}.tcraft", std::process::id()));
     std::fs::write(&path, &bytes).unwrap();
     execute(&mut original, "file.open", &json!({"path": path})).unwrap();
-    assert_eq!(original.log, recovered.log);
+    assert!(original.log.iter().eq(recovered.log.iter()));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     std::fs::remove_file(path).unwrap();
 }

@@ -120,13 +120,14 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
             let divider_x = split_divider_x(app, ui, full);
             let left = Rect::from_min_max(full.min, pos2(divider_x - SPLIT_LINE_HALF_WIDTH, full.max.y));
             let right = Rect::from_min_max(pos2(divider_x + SPLIT_LINE_HALF_WIDTH, full.min.y), full.max);
+            let (rect_3d, rect_2d) = if app.ui.swap_views { (right, left) } else { (left, right) };
 
             // Each view draws only on its side, so overlays such as the texture set name stay out of a narrow neighbour
             let clip = ui.clip_rect();
-            ui.set_clip_rect(left.intersect(clip));
-            view_3d(app, ui, left, &mut sync);
-            ui.set_clip_rect(right.intersect(clip));
-            view_2d(app, ui, right, &mut sync);
+            ui.set_clip_rect(rect_3d.intersect(clip));
+            view_3d(app, ui, rect_3d, &mut sync);
+            ui.set_clip_rect(rect_2d.intersect(clip));
+            view_2d(app, ui, rect_2d, &mut sync);
             ui.set_clip_rect(clip);
             split_divider_grab(ui, full, divider_x);
             let line = Stroke::new(SPLIT_LINE_HALF_WIDTH * 2.0, tokens.chrome);
@@ -165,10 +166,9 @@ fn empty_views(app: &mut TextureCraftApp, ui: &mut Ui) {
         ViewLayout::Only2D => vec![(full, "v2d")],
         ViewLayout::Split => {
             let middle = (full.left() + full.width() * 0.5).round();
-            vec![
-                (Rect::from_min_max(full.min, pos2(middle - SPLIT_LINE_HALF_WIDTH, full.max.y)), "v3d"),
-                (Rect::from_min_max(pos2(middle + SPLIT_LINE_HALF_WIDTH, full.min.y), full.max), "v2d"),
-            ]
+            let left = Rect::from_min_max(full.min, pos2(middle - SPLIT_LINE_HALF_WIDTH, full.max.y));
+            let right = Rect::from_min_max(pos2(middle + SPLIT_LINE_HALF_WIDTH, full.min.y), full.max);
+            if app.ui.swap_views { vec![(left, "v2d"), (right, "v3d")] } else { vec![(left, "v3d"), (right, "v2d")] }
         }
     };
 
@@ -203,8 +203,13 @@ fn clamp_split_ratio(ratio: f32, width: f32) -> f32 {
 fn split_divider_x(app: &mut TextureCraftApp, ui: &Ui, full: Rect) -> f32 {
     // The 2D view's left edge, beside the line, sits on a whole pixel
     let pixels_per_point = ui.ctx().pixels_per_point();
+
+    // The ratio is the 3D view's share, so a swap moves the divider to the other side of the width
+    let swapped = app.ui.swap_views;
     let divider_x = |ratio: f32| {
-        let unsnapped = full.left() + full.width() * clamp_split_ratio(ratio, full.width());
+        let left_share = clamp_split_ratio(ratio, full.width());
+        let left_share = if swapped { 1.0 - left_share } else { left_share };
+        let unsnapped = full.left() + full.width() * left_share;
         (unsnapped + SPLIT_LINE_HALF_WIDTH).round_to_pixels(pixels_per_point) - SPLIT_LINE_HALF_WIDTH
     };
     let old_x = divider_x(app.ui.split_ratio);
@@ -218,7 +223,8 @@ fn split_divider_x(app: &mut TextureCraftApp, ui: &Ui, full: Rect) -> f32 {
         // `max` and `min` rather than `clamp`, so a NaN bound from a corrupt saved zoom can't panic
         let (min_x, max_x) = divider_range_keeping_uv_size(&app.ui, full, old_x, pixels_per_point);
         let target_x = pointer.x.max(min_x).min(max_x);
-        app.ui.split_ratio = clamp_split_ratio((target_x - full.left()) / full.width(), full.width());
+        let left_share = (target_x - full.left()) / full.width();
+        app.ui.split_ratio = clamp_split_ratio(if swapped { 1.0 - left_share } else { left_share }, full.width());
         let new_x = divider_x(app.ui.split_ratio);
         keep_uv_view_on_screen(&mut app.ui, full, old_x, new_x);
     }
@@ -269,8 +275,9 @@ const STENCIL_OUTLINE_DASH: f32 = 5.0;
 const STENCIL_OUTLINE_GAP: f32 = 4.0;
 
 /// The 2D view's width when the split divider is at `divider_x`
-fn uv_view_width(full: Rect, divider_x: f32) -> f32 {
-    (full.right() - divider_x - SPLIT_LINE_HALF_WIDTH).max(1.0)
+fn uv_view_width(full: Rect, divider_x: f32, swapped: bool) -> f32 {
+    let width = if swapped { divider_x - full.left() } else { full.right() - divider_x };
+    (width - SPLIT_LINE_HALF_WIDTH).max(1.0)
 }
 
 /// The share of the 2D view's height that a zoom of 1 fills at `width`: the view fits the texture to its narrower side
@@ -281,19 +288,25 @@ fn uv_view_fit(full: Rect, width: f32) -> f32 {
 /// The divider positions where the 2D zoom that keeps the texture's screen size stays inside the 2D zoom range
 fn divider_range_keeping_uv_size(ui_state: &crate::state::UiState, full: Rect, old_x: f32, pixels_per_point: f32) -> (f32, f32) {
     // The zoom times the fit is the texture's screen size, which a divider drag keeps
-    let screen_zoom = ui_state.uv_zoom * uv_view_fit(full, uv_view_width(full, old_x));
+    let screen_zoom = ui_state.uv_zoom * uv_view_fit(full, uv_view_width(full, old_x, ui_state.swap_views));
 
     // Whole pixels, rounded inward, so snapping the divider to a pixel can't step past the range
     let narrowest_view = (full.height() * screen_zoom / UV_VIEW_MAX_ZOOM * pixels_per_point).ceil() / pixels_per_point;
     let widest_view = (full.height() * screen_zoom / UV_VIEW_MIN_ZOOM * pixels_per_point).floor() / pixels_per_point;
 
+    if ui_state.swap_views {
+        // The 2D view is on the left: the divider moves right to widen it
+        let edge = full.left() + SPLIT_LINE_HALF_WIDTH;
+        return (edge + narrowest_view, edge + widest_view);
+    }
+
     let edge = full.right() - SPLIT_LINE_HALF_WIDTH;
     (edge - widest_view, edge - narrowest_view)
 }
 
-/// Keeps the 2D view's texture at the same size and offset from the view's centre when the divider moves its left edge from `old_x` to `new_x`
+/// Keeps the 2D view's texture at the same size and offset from the view's centre when the divider moves its edge from `old_x` to `new_x`
 fn keep_uv_view_on_screen(ui_state: &mut crate::state::UiState, full: Rect, old_x: f32, new_x: f32) {
-    let (old_width, new_width) = (uv_view_width(full, old_x), uv_view_width(full, new_x));
+    let (old_width, new_width) = (uv_view_width(full, old_x, ui_state.swap_views), uv_view_width(full, new_x, ui_state.swap_views));
     ui_state.uv_zoom *= uv_view_fit(full, old_width) / uv_view_fit(full, new_width);
 
     // The horizontal pan is in half view widths
@@ -306,11 +319,12 @@ fn split_divider_grab(ui: &Ui, full: Rect, divider_x: f32) {
     ui.interact(zone, split_divider_id(ui), Sense::drag()).on_hover_and_drag_cursor(egui::CursorIcon::ResizeHorizontal);
 }
 
-/// The shader's view modes (`Shade::view_mode`): the material, one channel, the aux texture (mesh map, mask or quick mask), the UV checker
+/// The shader's view modes (`Shade::view_mode`): the material, one channel, the aux texture (mesh map, mask or quick mask), the UV checker, the combined normal
 const VIEW_MODE_MATERIAL: u32 = 0;
 const VIEW_MODE_CHANNEL: u32 = 1;
 const VIEW_MODE_AUX_TEXTURE: u32 = 2;
 const VIEW_MODE_UV_CHECKER: u32 = 3;
+const VIEW_MODE_NORMAL_HEIGHT_MESH: u32 = 4;
 
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
@@ -319,6 +333,7 @@ fn shade(app: &TextureCraftApp) -> Shade {
         ViewMode::Channel(selected_channel) => (VIEW_MODE_CHANNEL, selected_channel.index() as u32),
         ViewMode::MeshMap(_) | ViewMode::Mask(_) => (VIEW_MODE_AUX_TEXTURE, 0),
         ViewMode::UvChecker => (VIEW_MODE_UV_CHECKER, 0),
+        ViewMode::NormalHeightMesh => (VIEW_MODE_NORMAL_HEIGHT_MESH, 0),
     };
     let set_index = app.session.ts();
     let height_strength = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.atlas_height_strength()).unwrap_or(1.0);
@@ -511,6 +526,13 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
         });
     }
 
+    view_mode_picker(app, &mut child, &format!("{id}_mode"), VIEW_PICKER_WIDTH);
+}
+
+/// The view-mode picker of a view's header and of Display Settings: the material, the channels, the mesh maps and the UV checker
+pub(crate) fn view_mode_picker(app: &mut TextureCraftApp, child: &mut Ui, id_salt: &str, width: f32) {
+    let project_open = app.session.project_open;
+
     // Bake mode lights the project mesh with the neutral material unless the painted one is asked for
     let baking = app.ui.mode == crate::state::Mode::Baking;
     let neutral = baking && app.session.view == ViewMode::Material && app.ui.bake_visualization.neutral_shown;
@@ -523,13 +545,13 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
 
     // The picker stays greyed without project maps
     child.add_enabled_ui(project_open, |child| {
-        egui::ComboBox::from_id_salt(format!("{id}_mode")).width(VIEW_PICKER_WIDTH).selected_text(tr(&label)).show_ui(child, |ui| {
+        egui::ComboBox::from_id_salt(id_salt).width(width).selected_text(tr(&label)).show_ui(child, |ui| {
             if baking && ui.selectable_label(neutral, tr("Neutral Material")).clicked() {
                 app.ui.bake_visualization.neutral_shown = true;
                 app.run("viewport.view", json!({"mode": "material"}));
             }
             if ui.selectable_label(app.session.view == ViewMode::Material && !neutral, tr("Material")).clicked() && project_open {
-                // Only bake mode's pick turns the neutral material off; painting mode's Material leaves bake mode's choice alone
+                // Keep the bake material choice when switching to Material in Painting mode
                 app.ui.bake_visualization.neutral_shown &= !baking;
                 app.run("viewport.view", json!({"mode": "material"}));
             }
@@ -549,6 +571,9 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
                 if ui.selectable_label(app.session.view == ViewMode::Channel(channel), tr(channel.label())).clicked() {
                     app.run("viewport.view", json!({"mode": channel.id()}));
                 }
+            }
+            if ui.selectable_label(app.session.view == ViewMode::NormalHeightMesh, tr(texturecraft_engine::NORMAL_HEIGHT_MESH_LABEL)).clicked() {
+                app.run("viewport.view", json!({"mode": "normalHeightMesh"}));
             }
             ui.separator();
             mesh_map_entries(app, ui);
@@ -685,10 +710,18 @@ fn snapped_orbit(app: &mut TextureCraftApp, delta: egui::Vec2) {
     let limit = 89f32.to_radians();
     let camera = &mut app.session.camera;
     let (yaw, pitch) = app.orbit_snap.get_or_insert((camera.yaw, camera.pitch));
-    *yaw -= delta.x * ORBIT_RADIANS_PER_POINT;
-    *pitch = (*pitch + delta.y * ORBIT_RADIANS_PER_POINT).clamp(-step, step);
-    camera.yaw = (*yaw / step).round() * step;
-    camera.pitch = ((*pitch / step).round() * step).clamp(-limit, limit);
+    let radians_per_point = ORBIT_RADIANS_PER_POINT * app.ui.prefs.orbit_scale();
+    *yaw -= delta.x * radians_per_point;
+    *pitch = (*pitch + delta.y * radians_per_point).clamp(-step, step);
+
+    // A free camera is put level on the step
+    camera.set_angles((*yaw / step).round() * step, ((*pitch / step).round() * step).clamp(-limit, limit));
+}
+
+/// Orbit the 3D view by a drag of `delta` points at the Settings rotation speed.
+pub(crate) fn orbit(app: &mut TextureCraftApp, delta: egui::Vec2) {
+    let radians_per_point = ORBIT_RADIANS_PER_POINT * app.ui.prefs.orbit_scale();
+    app.session.camera.orbit(delta.x * radians_per_point, delta.y * radians_per_point);
 }
 
 fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut PendingSync) {
@@ -719,17 +752,17 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if shift {
             snapped_orbit(app, delta);
         } else {
-            app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
+            orbit(app, delta);
         }
     } else if response.dragged_by(PointerButton::Secondary) {
         app.camera_glide = None;
         if alt {
-            app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT);
+            app.session.camera.zoom(-delta.y * DRAG_ZOOM_PER_POINT * app.ui.prefs.drag_zoom_scale());
         } else if shift {
             let display = &mut app.session.doc.project.display;
             display.env_rotation = (display.env_rotation + delta.x * LIGHT_DEGREES_PER_POINT).rem_euclid(360.0);
         } else {
-            app.session.camera.orbit(delta.x * ORBIT_RADIANS_PER_POINT, delta.y * ORBIT_RADIANS_PER_POINT);
+            orbit(app, delta);
         }
     }
 
@@ -753,7 +786,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                 scale_brush_by_wheel(app, scroll);
             } else {
                 app.camera_glide = None;
-                app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT);
+                app.session.camera.zoom(scroll * WHEEL_ZOOM_PER_POINT * app.ui.prefs.wheel_zoom_scale());
             }
         }
     }
@@ -770,7 +803,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         if gesture.num_touches >= 3 {
             app.session.camera.pan(moved.x / size.y, moved.y / size.y);
         } else {
-            app.session.camera.orbit(moved.x * ORBIT_RADIANS_PER_POINT, moved.y * ORBIT_RADIANS_PER_POINT);
+            orbit(app, moved);
         }
         if gesture.zoom_delta.is_finite() && gesture.zoom_delta > 0.0 {
             app.session.camera.zoom(gesture.zoom_delta.ln());

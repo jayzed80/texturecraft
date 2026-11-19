@@ -175,7 +175,7 @@ impl Session {
         session.doc.project.mesh_file = leaf_of(file_name);
         session.doc.project.cameras = imported.cameras;
 
-        session.log.extend(imported.report.warnings);
+        session.log.extend_warnings(imported.report.warnings);
         session.log.push(format!(
             "Imported {} ({} triangles, {} materials{})",
             file_name,
@@ -209,7 +209,7 @@ impl Session {
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
         s.load_bake_paint(pf.bake_paint);
-        s.log.extend(pf.warnings);
+        s.log.extend_warnings(pf.warnings);
 
         Ok(s)
     }
@@ -367,16 +367,26 @@ fn set_index(s: &Session, v: &Value, cmd: &str) -> Result<usize> {
     v.as_u64().and_then(|index| usize::try_from(index).ok()).filter(|index| *index < s.set_count()).ok_or_else(|| bad(cmd, "invalid `ts`"))
 }
 
-fn plan(s: &mut Session, p: &Value) -> Result<Value> {
-    let opts = export_options(s, p, "export.plan")?;
-    let mesh_name = stem_of(s.doc.project.mesh.trim_start_matches("builtin:"));
-    let mut names = Vec::new();
-    for ts in sets_param(s, p, "export.plan")? {
-        for f in texturecraft_formats::list_outputs(&s.doc.project, ts, &mesh_name, &opts).map_err(fe)? {
-            names.push(json!({"ts": ts, "map": f.map, "file": f.name, "format": f.format.extension(), "bitDepth": f.bit_depth, "warnings": f.warnings}));
+fn plan(session: &mut Session, params: &Value) -> Result<Value> {
+    let options = export_options(session, params, "export.plan")?;
+    let project = &session.doc.project;
+    let mesh_name = stem_of(project.mesh.trim_start_matches("builtin:"));
+
+    let mut files = Vec::new();
+    for set_index in sets_param(session, params, "export.plan")? {
+        for output in texturecraft_formats::list_outputs(project, set_index, &mesh_name, &options).map_err(fe)? {
+            files.push(json!({
+                "ts": set_index,
+                "map": output.map,
+                "file": output.name,
+                "format": output.format.extension(),
+                "bitDepth": output.bit_depth,
+                "warnings": output.warnings,
+            }));
         }
     }
-    Ok(json!(names))
+
+    Ok(Value::Array(files))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -412,7 +422,7 @@ mod native {
             let f = read_mesh("file.open", path)?;
             let mut s = Session::from_mesh_bytes(&f.name, &f.bytes, 2048, &stem_of(path))?;
             s.doc.project.mesh_path = absolute(path);
-            s.log.extend(f.warnings);
+            s.log.extend_warnings(f.warnings);
             Ok(s)
         }
     }
@@ -449,7 +459,7 @@ fn new_from_mesh(session: &mut Session, params: &Value) -> Result<Value> {
 
     let mut next = Session::from_mesh_source(&mesh_file.name, Cow::Owned(mesh_file.bytes), u32::try_from(resolution).unwrap_or(0), &name, uv_tiles)?;
     next.doc.project.mesh_path = native::absolute(path);
-    next.log.extend(mesh_file.warnings);
+    next.log.extend_warnings(mesh_file.warnings);
     if crate::commands::boolp(params, "importCameras") == Some(false) {
         next.doc.project.cameras.clear();
     }
@@ -547,20 +557,19 @@ impl Session {
             doc.project.mesh_file = mesh_file;
         }
         let mut next = Session::new(doc, mesh, source)?;
-        next.log.extend(warnings);
+        next.log.extend_warnings(warnings);
         next.path = self.path.clone();
         next.sync_images();
-        // The high polys and the skew map stay. The cage is sampled by triangle index and
-        // barycentrics, so it stays only for an identical mesh; the low poly's base colours are
-        // read again from the new mesh.
+
+        // The cage uses triangle indices and barycentrics, so it needs identical geometry
         next.bake_meshes = self.bake_meshes.clone();
         next.bake_meshes.low_base_color = Default::default();
         if next.bake_meshes.cage.is_some() && *next.mesh != *self.mesh {
             next.bake_meshes.cage = None;
-            next.log.push("the cage mesh was dropped: the low-poly mesh changed".into());
+            next.log.warn("the cage mesh was dropped: the low-poly mesh changed".into());
         }
         if self.doc.bake_paint.keys().any(|(_, target)| *target == texturecraft_core::BakePaintTarget::Skew) && self.source.uvs != next.source.uvs {
-            next.log.push("the skew map is laid over the old UV layout; check it in Bake mode".into());
+            next.log.warn("the skew map is laid over the old UV layout; check it in Bake mode".into());
         }
         next.modified = true;
         next.project_id = self.project_id;

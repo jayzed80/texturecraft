@@ -56,6 +56,7 @@ fn tile_resolution(session: &mut Session, params: &Value) -> Result<Value> {
     }
 
     session.cancel_stroke();
+    let mut warnings = Vec::new();
     let size = session.edit("UV tile resolution", |session| {
         let texture_set = session.doc.project.texture_set_mut(texture_set_index)?;
         let previous = texture_set.clone();
@@ -67,10 +68,11 @@ fn tile_resolution(session: &mut Session, params: &Value) -> Result<Value> {
         check_size(texture_set)?;
         let size = texture_set.size();
         if previous.tile_resolution(tile) != resolution {
-            relayout(&mut session.doc, texture_set_index, &previous, &mut session.log)?;
+            relayout(&mut session.doc, texture_set_index, &previous, &mut warnings)?;
         }
         Ok(size)
     })?;
+    session.log.extend_warnings(warnings);
     Ok(json!({ "ts": texture_set_index, "tile": tile, "resolution": resolution, "size": size }))
 }
 
@@ -92,6 +94,7 @@ fn uv_tiles(session: &mut Session, params: &Value) -> Result<Value> {
     // Leaving UV tile mode keeps tile 1001, the area a classic set paints
     let dropped: Vec<u32> = texture_set.uv_tiles.iter().copied().filter(|tile| !enabled && *tile != 1001).collect();
     session.cancel_stroke();
+    let mut warnings = Vec::new();
     session.edit(if enabled { "Use UV tiles" } else { "Stop using UV tiles" }, |session| {
         let texture_set = session.doc.project.texture_set_mut(texture_set_index)?;
         let previous = texture_set.clone();
@@ -99,8 +102,9 @@ fn uv_tiles(session: &mut Session, params: &Value) -> Result<Value> {
         texture_set.bake_excluded_tiles.retain(|tile| tiles.contains(tile));
         texture_set.uv_tiles = tiles.clone();
         check_size(texture_set)?;
-        relayout(&mut session.doc, texture_set_index, &previous, &mut session.log)
+        relayout(&mut session.doc, texture_set_index, &previous, &mut warnings)
     })?;
+    session.log.extend_warnings(warnings);
     Ok(json!({ "ts": texture_set_index, "uvTiles": tiles, "dropped": dropped }))
 }
 

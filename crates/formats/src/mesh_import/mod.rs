@@ -532,6 +532,7 @@ fn orbit_cameras(raw: &[RawCamera], mesh: &Mesh) -> Vec<texturecraft_core::Camer
                 distance,
                 fov,
                 ortho: c.ortho_half_height.is_some(),
+                orientation: None,
             })
         })
         .collect()

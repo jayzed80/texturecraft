@@ -339,11 +339,14 @@ pub struct Camera {
     /// Vertical field of view, degrees (orthographic: the view height at `distance`).
     pub fov: f32,
     pub ortho: bool,
+    /// Free-camera quaternion in x, y, z, w order, when the view was saved in free mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<[f32; 4]>,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { name: "Camera".into(), target: [0.0; 3], yaw: 0.0, pitch: 0.0, distance: 5.0, fov: 40.0, ortho: false }
+        Camera { name: "Camera".into(), target: [0.0; 3], yaw: 0.0, pitch: 0.0, distance: 5.0, fov: 40.0, ortho: false, orientation: None }
     }
 }
 

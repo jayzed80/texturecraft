@@ -153,6 +153,12 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   edited): drop one from the Assets panel on a slot of the Texture Set Settings, or pick it from
   the slot's menu. A UV-tiled set takes one image per tile, named with its tile number
   (`ao.1001.png`, `ao.1002.png`…): drop or pick any one of them.
+- **Bake presets:** Mesh Map Bakers > Presets saves the active texture set's bake settings under a
+  name, loads one back into the active set (its Include in Bake choice stays) and deletes it.
+  Presets are kept between sessions. **Apply to All Texture Sets** copies the active set's settings,
+  including its map list, to every set. When a bake ends, a toast shows the elapsed time and
+  counts newly baked maps and failed sets. **Open Log** on a failed bake shows the General
+  channel with the summary and the message for each failed set.
 - **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
   finished; the bake bar follows the newest map, pins a finished one or shows the material.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
@@ -162,6 +168,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   override and OpenGL or DirectX normals.
 - **Output template editor:** build your own presets with per-channel packing, converted maps and per-channel inversion,
   and share them as JSON.
+- **Export panel** on the right bar: *Export Mesh...* asks for the mesh export options, then for
+  the file; *Export Textures...* opens the Export textures window (Settings, Output templates and
+  List of exports, *Include all*, *Save settings* and the number of textures the export writes).
 - **Mesh export** to OBJ with an MTL material library and its maps (PBR extension keys for
   roughness, metallic, normal and coat; UV-tiled sets keep their UDIM UVs and export their maps
   through Export textures), textured GLB (with clear coat and sheen) and USD (with clear coat).
@@ -181,7 +190,9 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - View any channel, any baked mesh map, or a UV checker; Alt+drag to orbit (Alt+Shift+drag in 90°
   steps), middle-drag to pan, wheel to zoom, F to show the entire mesh, Shift+F to frame the active
   texture set (a floor plane or other helper geometry stays out of the view and the orbit pivot),
-  M / C / B to cycle views. Orbit, pan and zoom buttons in the corner of each view do the same with a
+  M / C / B to cycle views. Choose **free (trackball) or constrained rotation** in the top bar (free
+  turns the model over; commands for stepped turns and for the next / previous saved camera can be
+  bound in Settings), and the **Normal+height+mesh** view in the view picker. Orbit, pan and zoom buttons in the corner of each view do the same with a
   plain drag, so a pen and tablet can navigate without a keyboard or wheel (Viewport menu ▸
   Navigation buttons hides them).
 - **Perspective (F5) or orthographic (F6)** projection, and **front, back, left, right, top and
@@ -191,18 +202,33 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 
 ## Interface
 
+- **Swap 3D/2D** (F4, Viewport menu and the layout dropdown, rebindable) puts the 2D view on the left and the 3D view on the right in the split layout. Painting, the divider and the views' headers work on both sides, and the choice is kept with the UI state.
 - A modern look in **four brightness levels** (dark, medium dark, medium light and light) with
-  **seven accent colors**, set in Settings › Interface.
+  **seven accent colors**, set in Settings › General › Appearance.
 - **Its own title bar** with the app icon, menus and window buttons on Windows (and on Linux
   desktops that leave the frame to the app, such as GNOME), the macOS traffic lights over the same
-  strip, and Settings › Interface › System title bar for the system's frame instead.
+  strip, and Settings › General › Appearance › System title bar for the system's frame instead.
 - **Dockable, tabbed and floating panels**, saved layouts, and panels that reopen where you closed
-  them.
+  them. The right bar's panels (Export, Log, Display Settings, Shader Settings, History) pop out
+  beside it; *Undock* makes one a floating window, and its *Dock* button puts it back on the bar.
+- **Display and Shader Settings** are one scrolling page each: their section tabs jump to a
+  section, and scrolling highlights the tab of the section in view.
+- A **Log** panel with a *General* and an *Assets* tab: asset messages (resources that do not
+  decode, skipped templates and presets, PBR folder and MaterialX import warnings) go under Assets.
 - **No project at launch**: empty views, panels and toolbars until you create or open one (File ›
   New project, Open, Recent projects, Open sample project); File › Close returns to that state.
 - A **data folder** of your choice for autosaves, smart materials, presets, templates and UI
-  layouts, on any drive (Settings › Folders; `Documents/TextureCraft` by default).
+  layouts, on any drive (Settings › General › Folders; `Documents/TextureCraft` by default).
+- A **Settings window** (Edit › Settings) with General, Shortcuts and Libraries pages; changes
+  apply on OK and Cancel drops them. General holds the language (or the system's), the 3D view's
+  rotation, zoom and wheel speeds with inverse directions, GPU or CPU bake rays, resource limits
+  (worker threads, cores kept for the UI, RAM while saving, project size on open) and the autosave
+  interval. Shortcuts lists the actions that can be bound to keys. Libraries adds or removes folders whose saved smart
+  materials and masks the shelf lists.
 - A **shortcut editor** with conflict detection, listing every menu item and every command a key can run (commands that need a path, name or similar are left out), and every shortcut shown in its tooltip.
+- **Help menu:** Release notes... opens the project's releases page. Export log... writes every
+  channel to a text file with each entry's recorded UTC time and severity. The desktop app asks
+  for a destination, and the browser downloads the file.
 - A **History** panel: click any step to go back to it, or forward again to an undone one.
 - **10 languages:** English, French, German, Spanish, Portuguese, Italian, Japanese, Chinese,
   Korean and Arabic, switchable live.
