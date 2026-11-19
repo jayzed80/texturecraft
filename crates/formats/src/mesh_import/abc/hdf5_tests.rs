@@ -882,6 +882,33 @@ fn hdf5_huge_counts_are_refused_without_allocating() {
 }
 
 #[test]
+fn hdf5_names_are_charged_against_the_decode_budget() {
+    // Link and attribute names are copied into Strings, and a symbol table node or attribute
+    // B-tree can be reached many times over through repeated child addresses. The names must
+    // therefore count against the decode budget: a small file with long names has to fail. The
+    // budget is lowered here so the test stays small.
+    for style in STYLES {
+        let mut w = W::new(style);
+        let leaf = w.group(&[], &[]);
+        let long = "n".repeat(60);
+        let links: Vec<(String, u64)> = (0..12).map(|i| (format!("{long}{i:02}"), leaf)).collect();
+        let attrs: Vec<Vec<u8>> = (0..12i32).map(|i| w.attribute(&format!("{long}{i:02}"), Ty::I32, None, &i.to_le_bytes())).collect();
+        let group = w.group(&links, &attrs);
+        let bytes = w.finish(group);
+        // 100 bytes left: twelve 62-byte names cannot fit, in either list.
+        let open = || {
+            let mut h = super::hdf5::H5::open(&bytes).unwrap();
+            h.charge(super::MAX_DECODED_BYTES - 100).unwrap();
+            h
+        };
+        let e = open().links(group).err().unwrap_or_else(|| panic!("{style:?} read links past the budget")).to_string();
+        assert!(e.contains("more than"), "{style:?}: {e}");
+        let e = open().attributes(group).err().unwrap_or_else(|| panic!("{style:?} read attributes past the budget")).to_string();
+        assert!(e.contains("more than"), "{style:?}: {e}");
+    }
+}
+
+#[test]
 fn hdf5_bad_offsets_are_errors() {
     for style in STYLES {
         let bytes = sample_file(style, true);

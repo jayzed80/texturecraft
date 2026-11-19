@@ -504,7 +504,7 @@ impl<'a> H5<'a> {
     }
 
     /// A link message; `None` for soft, external and user-defined links.
-    fn link(&self, data: &[u8]) -> Result<Option<Link>> {
+    fn link(&mut self, data: &[u8]) -> Result<Option<Link>> {
         let mut r = Rd::new(data);
         let version = r.u8()?;
         if version != 1 {
@@ -517,6 +517,9 @@ impl<'a> H5<'a> {
             r.skip(1)?;
         }
         let n = r.usize(1 << (flags & 0x03))?;
+        // The name is copied into a `String`: charge it and its entry, so the names of a file
+        // whose links are reached many times over stay within the decode budget.
+        self.charge(n.saturating_add(std::mem::size_of::<Link>()))?;
         let name = String::from_utf8_lossy(r.take(n)?).into_owned();
         if kind != 0 {
             return Ok(None);
@@ -592,7 +595,11 @@ impl<'a> H5<'a> {
             let cache = r.u32()?;
             r.skip(4 + 16)?;
             let name = names.get(name_at..).ok_or_else(|| bad("a link name past its local heap"))?;
-            let name = String::from_utf8_lossy(name.split(|c| *c == 0).next().unwrap_or_default()).into_owned();
+            let name = name.split(|c| *c == 0).next().unwrap_or_default();
+            // The name is copied into a `String`: charge it and its entry, so a symbol table node
+            // that many B-tree entries point at cannot allocate past the decode budget.
+            self.charge(name.len().saturating_add(std::mem::size_of::<Link>()))?;
+            let name = String::from_utf8_lossy(name).into_owned();
             // Cache type 2 is a soft link.
             if let (Some(addr), false) = (target, cache == 2) {
                 out.push(Link { name, addr, order: None });
@@ -648,7 +655,7 @@ impl<'a> H5<'a> {
     }
 
     /// An attribute message (versions 1 to 3).
-    fn attribute(&self, data: &'a [u8]) -> Result<Attr<'a>> {
+    fn attribute(&mut self, data: &'a [u8]) -> Result<Attr<'a>> {
         let mut r = Rd::new(data);
         let version = r.u8()?;
         let flags = r.u8()?;
@@ -667,7 +674,11 @@ impl<'a> H5<'a> {
         // Version 1 pads the name, datatype and dataspace to 8 bytes each.
         let padded = |n: usize| if version == 1 { n.next_multiple_of(8) } else { n };
         let name = r.take(padded(name_size))?.get(..name_size).unwrap_or_default();
-        let name = String::from_utf8_lossy(name.split(|c| *c == 0).next().unwrap_or_default()).into_owned();
+        let name = name.split(|c| *c == 0).next().unwrap_or_default();
+        // The name is copied into a `String`: charge it and its entry, so attributes reached many
+        // times over cannot allocate past the decode budget.
+        self.charge(name.len().saturating_add(std::mem::size_of::<Attr>()))?;
+        let name = String::from_utf8_lossy(name).into_owned();
         let dtype = Dtype::parse(r.take(padded(type_size))?.get(..type_size).unwrap_or_default())?;
         let space = Space::parse(r.take(padded(space_size))?.get(..space_size).unwrap_or_default(), self.sl)?;
         let bytes = space
