@@ -118,6 +118,48 @@ fn glb_two_materials_mirrored_node() {
     m.validate().unwrap();
 }
 
+/// A scene without a `nodes` array is legal glTF (Blender writes one for a scene with no exported
+/// objects); it must not stop the default scene from importing.
+#[test]
+fn gltf_scene_without_nodes_imports_the_default_scene() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let im = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    // Only an empty scene: nothing to import, but a clear error rather than a parse failure.
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }]);
+    json["scene"] = 0.into();
+    let err = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap_err();
+    assert!(!err.to_string().contains("missing field"), "{err}");
+}
+
+#[test]
+fn glb_scene_without_nodes_keeps_binary_mesh_in_default_scene() {
+    let original = glb(true, true);
+    let jlen = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&original[20..20 + jlen]).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let mut js = serde_json::to_vec(&json).unwrap();
+    while !js.len().is_multiple_of(4) {
+        js.push(b' ');
+    }
+    let bin_chunk = &original[20 + jlen..];
+    let mut glb = Vec::new();
+    glb.extend(b"glTF");
+    glb.extend(2u32.to_le_bytes());
+    glb.extend(((20 + js.len() + bin_chunk.len()) as u32).to_le_bytes());
+    glb.extend((js.len() as u32).to_le_bytes());
+    glb.extend(b"JSON");
+    glb.extend(js);
+    glb.extend(bin_chunk);
+    let im = import_mesh_bytes("scene.glb", &glb).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    assert_eq!(im.mesh.materials, ["Red", "Material_1"]);
+    assert_outward(&im.mesh);
+}
+
 #[test]
 fn gltf_embedded_buffers_and_missing_attributes() {
     let im = import_mesh_bytes("scene.gltf", &embedded_gltf()).unwrap();
@@ -236,6 +278,33 @@ fn obj_without_uvs_or_normals_is_completed() {
 }
 
 #[test]
+fn obj_with_some_objects_having_uvs_preserves_uvs_without_full_unwrap() {
+    let obj = "o Body
+v 0 0 0
+v 1 0 0
+v 1 1 0
+vt 0 0
+vt 1 0
+vt 1 1
+f 1/1 2/2 3/3
+o Helper
+v 2 0 0
+v 3 0 0
+v 3 1 0
+f 4 5 6
+";
+    let im = import_mesh_bytes("character.obj", obj.as_bytes()).unwrap();
+    assert!(!im.report.uvs_generated);
+    assert_eq!(im.mesh.uvs[0], Vec2::new(0.0, 1.0));
+    assert_eq!(im.mesh.uvs[1], Vec2::new(1.0, 1.0));
+    assert_eq!(im.mesh.uvs[2], Vec2::new(1.0, 0.0));
+    assert_eq!(im.mesh.uvs[3], Vec2::ZERO);
+    assert_eq!(im.mesh.uvs[4], Vec2::ZERO);
+    assert_eq!(im.mesh.uvs[5], Vec2::ZERO);
+    assert!(im.report.warnings.iter().any(|w| w.contains("some objects have no UVs")));
+}
+
+#[test]
 fn polygons_keep_their_edges_for_the_wireframe() {
     // An OBJ quad and pentagon (with UVs, so no unwrap splits them), a triangle, and a PLY quad.
     let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 2 0 0\nv 3 0 0\nv 3 1 0\nv 2.5 2 0\nv 2 1 0\nvt 0 0\n\
@@ -249,6 +318,46 @@ fn polygons_keep_their_edges_for_the_wireframe() {
     let tris = import_mesh_bytes("t.obj", b"v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nf 1/1 2/1 3/1\nf 1/1 3/1 4/1\n").unwrap().mesh;
     assert!(tris.diagonals.is_empty());
     assert_eq!(tris.wire_edges()[0].len(), 5);
+}
+
+#[test]
+fn imported_quads_get_quad_tangents() {
+    // A non-planar OBJ quad with sheared UVs: the importer keeps the quad for MikkTSpace, so its
+    // tangents differ from the same corners written as two triangles (Blender hands quads over).
+    let corners = "v 0 0 0
+v 1 0 0
+v 1 1 0.6
+v 0 1 0
+vt 0 0.1
+vt 1 0
+vt 0.9 1
+vt 0.3 0.8
+";
+    let quad = import_mesh_bytes(
+        "q.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    let tris = import_mesh_bytes(
+        "t.obj",
+        format!(
+            "{corners}f 1/1 2/2 3/3
+f 1/1 3/3 4/4
+"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+    .mesh;
+    assert_eq!((quad.indices.clone(), quad.positions.clone()), (tris.indices.clone(), tris.positions.clone()), "the render triangles are the same");
+    let widest = quad.tangents.iter().zip(&tris.tangents).map(|(a, b)| a.truncate().dot(b.truncate()).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max);
+    assert!(widest > 1.0, "quad tangents differ from triangle tangents by only {widest} degrees");
+    assert!(quad.tangents.iter().all(|t| t.is_finite()));
 }
 
 fn ply_ascii() -> String {
@@ -343,6 +452,43 @@ fn stl_ascii_and_binary() {
     let mut b = stl_binary();
     b[..5].copy_from_slice(b"solid");
     assert_eq!(import_mesh_bytes("c.stl", &b).unwrap().mesh.triangle_count(), 2);
+}
+
+#[test]
+fn stl_shared_reader_keeps_flat_normals_and_surfaces_shared_repairs_and_colors() {
+    let mut bytes = stl_binary();
+    // VisCAM/SolidView: bit 15 marks a facet color; red occupies bits 10..14.
+    bytes[132..134].copy_from_slice(&0xfc00u16.to_le_bytes());
+    // A third facet repeats that color after an uncolored facet. The shared reader groups its
+    // parts by color, so the adapter must restore the source facet order.
+    bytes.extend([0.0f32; 3].iter().flat_map(|v| v.to_le_bytes()));
+    for v in [[0.0f32, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]] {
+        bytes.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+    }
+    bytes.extend(0xfc00u16.to_le_bytes());
+    // Some exporters leave the header count at zero despite having facets.
+    bytes[80..84].copy_from_slice(&0u32.to_le_bytes());
+    let imported = import_mesh_bytes("colored.stl", &bytes).unwrap();
+    assert_eq!(imported.mesh.triangle_count(), 3);
+    assert_eq!(imported.mesh.submeshes.len(), 1);
+    assert_eq!(imported.mesh.submeshes[0].name, "colored");
+    assert_eq!(
+        imported.mesh.positions,
+        vec![
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0)
+        ]
+    );
+    assert_eq!(imported.mesh.normals, vec![Vec3::Z; 9]);
+    assert!(imported.mesh.colors.iter().any(|c| c.x > 0.99 && c.y < 0.01 && c.z < 0.01));
+    assert!(imported.report.warnings.iter().any(|w| w.contains("counts no facets")));
 }
 
 /// Every prefix and some corruptions of a valid file: errors, never panics (and never an
@@ -503,4 +649,23 @@ fn ply_face_element_before_vertex_element() {
     assert_eq!(mesh.positions.len(), 3);
     let bad = format!("{head}3 0 1 5\n0 0 0\n1 0 0\n0 1 0\n");
     assert!(import_mesh_bytes("a.ply", bad.as_bytes()).is_err());
+}
+
+#[test]
+fn group_index_preserves_order_and_reuses_nonadjacent_material_parts() {
+    let mut raw = super::RawMesh::default();
+    for i in 0..1000 {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[0, 1, 2]);
+    }
+    for i in (0..1000).rev() {
+        raw.group("shared", &i.to_string()).extend_from_slice(&[3, 4, 5]);
+    }
+    raw.group("other", "0").extend_from_slice(&[6, 7, 8]);
+    assert_eq!(raw.groups.len(), 1001);
+    for (i, (material, part, indices)) in raw.groups.iter().take(1000).enumerate() {
+        assert_eq!(material, "shared");
+        assert_eq!(part, &i.to_string());
+        assert_eq!(indices, &[0, 1, 2, 3, 4, 5]);
+    }
+    assert_eq!(raw.groups[1000], ("other".into(), "0".into(), vec![6, 7, 8]));
 }

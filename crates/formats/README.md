@@ -78,7 +78,7 @@ pub fn preset_from_json(json: &str) -> Result<ExportPreset>;
 pub fn preset_to_json(preset: &ExportPreset) -> Result<String>;
 ```
 
-- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)> }`
+- `ExportPreset { name, maps: Vec<MapSpec> }`, `MapSpec { file, format, bit_depth, channels: Vec<(Dest, SourceRef)>, inverted: Vec<Dest> }`
   (serde JSON, so presets can be user files).
 - `Dest`: `R G B A` or `L` (gray; `L` + `A` = gray + alpha).
 - `SourceRef`: `Channel { channel, component }` (`Normal` = the **final** normal in the export
@@ -128,6 +128,8 @@ pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>>;
 pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile>;
 pub fn save_project(path: &Path, pf: &ProjectFile) -> Result<()>;   // native, atomic
 pub fn load_project(path: &Path) -> Result<ProjectFile>;            // native
+pub fn set_project_open_limit_gib(limit_gib: u32);                 // subsequent loads, minimum 1 GiB
+pub fn project_open_limit_gib() -> u32;
 ```
 
 `.tcraft` layout (zip, deflate):
@@ -150,10 +152,31 @@ tile-resolution overrides. Older projects load their stored bake pixels as-is, w
 the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
 maps retain their working atlas layout.
 
+Project format version 3 stores baked bent normal maps in tangent space (OpenGL green, like the
+normal map). Version 2 and older files held them in world space: loading drops those maps, keeps
+the bake settings and warns that the Bent Normals map needs a re-bake.
+
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or
-out-of-range tiles and trailing data, drops pixels of layers that are in no stack, and caps the
-total decompressed size at 8 GiB.
+out-of-range tiles and trailing data, and drops pixels of layers that are in no stack. Total
+decompressed project data is limited to 8 GiB by default. Settings › Project › Max project size on
+open changes this limit, in GiB, independently of the save CPU and RAM preferences. Each load keeps
+the limit it started with; individual resource, mesh, image and entry-count limits still apply.
+The limit counts file data, including binary headers and tile coordinates, rather than peak process
+memory. Saves and autosaves are not refused by this open limit; raise it to reopen a larger project.
+
+Opening checks the sum of all declared ZIP payload sizes before decompression, including unknown
+entries, and checks actual reads against the same limit independently. Overlapping ZIP entries are
+rejected. ZIP indexing is restricted to the final 32 MiB with a 64 MiB read allowance before the
+100,000-entry limit can be checked. Baked-map dimensions must agree with the entry size; float data
+is read in bounded chunks with fallible allocation. Nested archives are not recursively extracted
+by the project reader. Subsequent image and mesh decoding has separate format-specific limits;
+the project-open limit is not a combined budget for those decoded assets or the application's heap.
+
+Native saves compress entries in parallel within the configured CPU allowance and an estimated
+in-flight byte budget. Stored resources and entries larger than that budget stream directly into
+the destination without a whole-entry temporary buffer. The save RAM percentage is an estimate,
+excluding compressor, allocator and project-snapshot overhead; it is not a peak process memory cap.
 
 Unreadable bake settings fall back to defaults field by field while readable settings and project
 content are retained. Legacy baked-map filenames remain readable; unsupported baked-map types are
