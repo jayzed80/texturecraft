@@ -2,6 +2,7 @@
 //! reimport, and the refusals (frames out of range, frames that change the topology).
 
 use serde_json::json;
+use texturecraft_engine::core::CageType;
 use texturecraft_engine::geom::primitives;
 use texturecraft_engine::{Session, execute};
 
@@ -172,21 +173,25 @@ fn the_mesh_follows_the_chosen_frame_and_keeps_its_paint() {
 }
 
 #[test]
-fn a_frame_change_finishes_a_box_fill_first() {
+fn a_frame_change_waits_for_a_box_fill_in_progress() {
     let mut s = session(&[triangle(0.0), triangle(1.0), triangle(2.0)]);
     execute(&mut s, "tool.polygonFill", &json!({})).unwrap();
     s.update();
     let history = s.history_labels().len();
-    assert!(
-        s.drag_polygon_fill_box_uv(texturecraft_engine::geom::glam::Vec2::ZERO, texturecraft_engine::geom::glam::Vec2::ONE).unwrap() > 0,
-        "the box fills the triangle"
-    );
+    let filled = s.drag_polygon_fill_box_uv(texturecraft_engine::geom::glam::Vec2::ZERO, texturecraft_engine::geom::glam::Vec2::ONE).unwrap();
+    assert!(filled > 0, "the box fills the triangle");
     assert_eq!(s.history_labels().len(), history, "a drag in progress is not a step yet");
 
+    // The viewport's drag would keep filling from its press point on the new shape.
+    let error = execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap_err().to_string();
+    assert!(error.contains("box fill"), "{error}");
+    assert_eq!((s.mesh_frame, heights(&s)), (0, vec![0.0; 3]), "the shape did not change");
+
+    // The drag is still the one it started, so it finishes as one step and the frame then moves.
+    assert_eq!(s.end_polygon_fill_box(), filled);
+    assert_eq!(s.history_labels().len(), history + 1);
     execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap();
-    assert_eq!(s.history_labels().len(), history + 1, "the frame change finished the drag as one step");
-    assert_eq!(s.history_labels().last().map(String::as_str), Some("Polygon fill"));
-    assert_eq!(s.end_polygon_fill_box(), 0, "no drag is left open on the new shape");
+    assert_eq!(heights(&s), vec![1.0; 3]);
 }
 
 #[test]
@@ -205,6 +210,40 @@ fn the_frame_is_saved_with_the_project_and_kept_by_reimport() {
 }
 
 #[test]
+fn reimporting_a_file_keeps_the_frame_and_falls_back_to_zero() {
+    let frames = [triangle(0.0), triangle(1.0), triangle(2.0)];
+    let file = |frames: &[Frame]| texturecraft_formats::MeshFile { name: "tri.abc".into(), bytes: alembic(frames), warnings: Vec::new() };
+    let mut s = session(&frames);
+    execute(&mut s, "file.setMeshFrame", &json!({ "frame": 2 })).unwrap();
+
+    s.reimport_mesh(Some(file(&frames)), false).unwrap();
+    assert_eq!((s.mesh_frame, s.mesh_frames), (2, 3), "the same file keeps the selected frame");
+    assert_eq!(heights(&s), vec![2.0; 3]);
+
+    // A file with fewer frames starts again at the first.
+    s.reimport_mesh(Some(file(&[triangle(0.0), triangle(1.0)])), false).unwrap();
+    assert_eq!((s.mesh_frame, s.mesh_frames), (0, 2));
+    assert_eq!(heights(&s), vec![0.0; 3]);
+}
+
+#[test]
+fn a_frame_change_drops_a_custom_cage() {
+    let mut s = session(&[triangle(0.0), triangle(1.0), triangle(2.0)]);
+    execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap();
+    // A high poly and a cage made for the frame-1 shape.
+    let mesh = "v 0 0 1\nv 1 0 1\nv 0 1 1\nf 1 2 3\n";
+    s.add_high_poly_bytes("high.obj", mesh.as_bytes().to_vec()).unwrap();
+    s.set_cage_bytes("cage.obj", mesh.as_bytes().to_vec()).unwrap();
+    s.doc.project.texture_sets[0].bake.cage.kind = CageType::CustomFile;
+    assert!(s.bake_task(0).is_ok(), "the cage fits the current frame");
+
+    execute(&mut s, "file.setMeshFrame", &json!({ "frame": 2 })).unwrap();
+    assert!(s.bake_meshes.cage.is_none(), "the cage belonged to the frame-1 shape");
+    let Err(error) = s.bake_task(0) else { panic!("a bake must not run with the cage gone") };
+    assert!(error.to_string().contains("requires a cage"), "a bake refuses the missing cage: {error}");
+}
+
+#[test]
 fn frames_that_cannot_be_used_are_refused_and_change_nothing() {
     let mut s = session(&[triangle(0.0), triangle(1.0), square()]);
     execute(&mut s, "file.setMeshFrame", &json!({ "frame": 1 })).unwrap();
@@ -212,6 +251,8 @@ fn frames_that_cannot_be_used_are_refused_and_change_nothing() {
         (json!({ "frame": 3 }), "out of range"),
         (json!({ "frame": 1e30 }), "out of range"),
         (json!({ "frame": 2 }), "topology"),
+        (json!({ "frame": 0.6 }), "whole number"),
+        (json!({ "frame": 1.5 }), "whole number"),
         (json!({ "frame": -1 }), "frame"),
         (json!({}), "frame"),
     ] {
@@ -219,6 +260,9 @@ fn frames_that_cannot_be_used_are_refused_and_change_nothing() {
         assert!(e.contains(wanted), "{params}: {e}");
         assert_eq!((s.mesh_frame, heights(&s)), (1, vec![1.0; 3]), "{params}");
     }
+    // A whole number written as a float is still a frame.
+    execute(&mut s, "file.setMeshFrame", &json!({ "frame": 0.0 })).unwrap();
+    assert_eq!(heights(&s), vec![0.0; 3]);
     let mut plane = Session::new_project("t", primitives::builtin("plane").unwrap(), "builtin:plane", None, 128).unwrap();
     assert!(execute(&mut plane, "file.setMeshFrame", &json!({ "frame": 0 })).is_err());
     // A still mesh file has one frame.

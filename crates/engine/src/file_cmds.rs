@@ -545,13 +545,18 @@ impl Session {
 
     /// Replace the mesh with `file` (or re-read the project's own copy) and keep the project:
     /// texture sets map by material index. Nothing changes unless the new mesh fits the project.
+    /// The selected frame is kept when the new mesh has it, else the mesh starts at frame 0.
     /// With `preserve_strokes`, painted pixels follow the surface where the UVs changed. Replies
     /// like `file.reimportMesh`: `{preserved?}`.
     pub fn reimport_mesh(&mut self, file: Option<texturecraft_formats::MeshFile>, preserve_strokes: bool) -> Result<Value> {
         let (imported, source, warnings, mesh_file, frame) = match file {
             Some(f) => {
-                let m = texturecraft_formats::import_mesh_bytes(&f.name, &f.bytes).map_err(fe)?;
-                (m, Some((ext_of(&f.name), f.bytes)), f.warnings, leaf_of(&f.name), 0)
+                let first = texturecraft_formats::import_mesh_bytes(&f.name, &f.bytes).map_err(fe)?;
+                // Reimport reads the same file again: stay on its frame while the file still has it,
+                // and start at the first when it does not.
+                let frame = if self.mesh_frame < first.frames { self.mesh_frame } else { 0 };
+                let m = if frame == 0 { first } else { texturecraft_formats::import_mesh_bytes_at(&f.name, &f.bytes, frame).map_err(fe)? };
+                (m, Some((ext_of(&f.name), f.bytes)), f.warnings, leaf_of(&f.name), frame)
             }
             None => match &self.mesh_source {
                 Some((ext, bytes)) => (
@@ -596,8 +601,19 @@ impl Session {
     }
 }
 
+/// The `frame` param as a whole number: a fraction is refused, not rounded to the next sample.
+fn whole_frame(p: &Value) -> Option<u64> {
+    let value = p.get("frame")?;
+    if let Some(frame) = value.as_u64() {
+        return Some(frame);
+    }
+
+    let frame = value.as_f64().filter(|f| f.is_finite() && *f >= 0.0 && f.fract() == 0.0)?;
+    Some(frame as u64)
+}
+
 fn set_mesh_frame(s: &mut Session, p: &Value) -> Result<Value> {
-    let frame = u64p(p, "frame").ok_or_else(|| bad("file.setMeshFrame", "give `frame`, a whole number from 0"))?;
+    let frame = whole_frame(p).ok_or_else(|| bad("file.setMeshFrame", "give `frame`, a whole number from 0"))?;
     s.set_mesh_frame(usize::try_from(frame).unwrap_or(usize::MAX))?;
     Ok(json!({ "frame": s.mesh_frame, "frames": s.mesh_frames }))
 }
@@ -620,6 +636,11 @@ impl Session {
         if frame == self.mesh_frame {
             return Ok(());
         }
+        // A box fill under way was measured on the old shape, and its viewport drag would keep
+        // filling from its press point on the new one: refuse until it ends, as a stroke does.
+        if self.polygon_fill_drag.is_some() {
+            return Err(bad("file.setMeshFrame", "finish the box fill in progress first"));
+        }
         let mesh = read_stored_mesh(&self.doc.project, ext, bytes, frame)?.mesh;
         let now = &*self.source;
         if mesh.indices != now.indices || mesh.uvs != now.uvs || mesh.submeshes != now.submeshes || mesh.materials != now.materials {
@@ -631,10 +652,13 @@ impl Session {
                 ),
             ));
         }
-        // A box fill under way was measured on the old shape: finish it as its own step first, as
-        // undo and tool changes do, so its next update doesn't use stale positions or depth.
-        self.end_polygon_fill_box();
         self.replace_mesh(mesh)?;
+        // A Custom File cage holds positions from the frame it was loaded with: a bake would cast
+        // its rays from the old shape's surface, so it goes as the low poly's shape did.
+        if self.bake_meshes.cage.is_some() {
+            self.bake_meshes.cage = None;
+            self.log.push("the cage mesh was dropped: the low-poly shape changed with the frame".into());
+        }
         self.mesh_frame = frame;
         self.modified = true;
         Ok(())
