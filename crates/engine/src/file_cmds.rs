@@ -2,6 +2,8 @@
 //! web; path-based commands are native only.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 #[cfg(not(target_arch = "wasm32"))]
@@ -230,9 +232,20 @@ impl Session {
         Ok(s)
     }
 
-    /// The project as a `ProjectFile` (for saving).
+    /// The project with independently owned resource bytes.
     pub fn project_file(&self) -> ProjectFile {
+        let resources = self.doc.resources.iter().map(|(name, bytes)| (name.clone(), bytes.as_ref().clone())).collect();
+        self.project_with_resources(resources)
+    }
+
+    /// A save snapshot that shares immutable resource payloads with the document.
+    pub fn project_snapshot(&self) -> ProjectFile<Arc<Vec<u8>>> {
+        self.project_with_resources(self.doc.resources.clone())
+    }
+
+    fn project_with_resources<Resource>(&self, resources: BTreeMap<String, Resource>) -> ProjectFile<Resource> {
         let mut pixels = self.doc.pixels.clone();
+
         // Drop pixel images whose size no longer matches their texture set
         let size_of = |id: texturecraft_core::LayerId| {
             self.doc.project.locate(id).and_then(|(ts, _, _)| self.doc.project.texture_sets.get(ts)).map(TextureSet::size).or_else(|| {
@@ -259,13 +272,14 @@ impl Session {
             cage,
             bake_paint: self.saved_bake_paint(),
             thumbnail: None,
-            resources: self.doc.resources.iter().map(|(k, v)| (k.clone(), v.as_ref().clone())).collect(),
+            resources,
             warnings: Vec::new(),
         }
     }
 
     pub fn to_project_bytes(&self) -> Result<Vec<u8>> {
-        texturecraft_formats::save_project_bytes(&self.project_file()).map_err(fe)
+        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
+        reservation.save_bytes(&self.project_snapshot()).map_err(fe)
     }
 
     /// Render every export file for texture sets `sets` (in memory; works on the web).
@@ -425,7 +439,9 @@ mod native {
 
     pub fn save_to(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         let path = if ext_of(path) == PROJECT_EXT { path.to_string() } else { format!("{path}.{PROJECT_EXT}") };
-        texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
+        let mut reservation = texturecraft_formats::RamReservation::for_save().map_err(fe)?;
+        reservation.save(Path::new(&path), &s.project_snapshot()).map_err(fe)?;
+
         if adopt {
             s.path = Some(path.clone());
             s.modified = false;

@@ -21,6 +21,20 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage> {
 /// [`decode_image`] for an image of at most `max_texels` (width × height), checked from the
 /// header, before any pixel is decoded or allocated.
 pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage> {
+    decode_image_with_limits(bytes, max_texels, image::Limits::default())
+}
+
+/// Decode a cook output under both its declared dimensions and decoder allocation budget.
+pub fn decode_cooked_image(bytes: &[u8], size: [u32; 2], max_decoder_bytes: u64) -> Result<DecodedImage> {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_decoder_bytes);
+    limits.max_image_width = Some(size[0]);
+    limits.max_image_height = Some(size[1]);
+    let texels = (u64::from(size[0]) * u64::from(size[1])).min(MAX_RESOURCE_TEXELS);
+    decode_image_with_limits(bytes, texels, limits)
+}
+
+fn decode_image_with_limits(bytes: &[u8], max_texels: u64, limits: image::Limits) -> Result<DecodedImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
@@ -28,8 +42,11 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
     // TGA has no magic signature; its decoder validates the header when no format was recognized
     let format = reader.format().unwrap_or(image::ImageFormat::Tga);
     reader.set_format(format);
+    reader.limits(limits);
 
-    let (width, height) = reader.into_dimensions().map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
+    let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })?;
     if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE {
         return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_IMAGE_SIZE})")));
     }
@@ -38,13 +55,21 @@ pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage
         return Err(FormatError::TooLarge(format!("image is {width}x{height}, more than {max_texels} texels")));
     }
 
-    let image = crate::guard("image", || {
-        image::load_from_memory_with_format(bytes, format).map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() })
-    })?;
+    let image = crate::guard("image", || reader.decode().map_err(|error| FormatError::Malformed { kind: "image", msg: error.to_string() }))?;
     let srgb = !matches!(image, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
     let float_image = image.into_rgba32f();
     let (width, height) = float_image.dimensions();
-    let rgba = float_image.pixels().map(|pixel| pixel.0).collect();
+
+    // Reuse the float buffer when its allocation can be represented as RGBA pixels
+    let rgba = match bytemuck::allocation::try_cast_vec(float_image.into_raw()) {
+        Ok(rgba) => rgba,
+        Err((_, samples)) => {
+            let mut rgba = Vec::new();
+            rgba.try_reserve_exact(samples.len() / 4).map_err(|error| FormatError::TooLarge(error.to_string()))?;
+            rgba.extend_from_slice(samples.as_chunks::<4>().0);
+            rgba
+        }
+    };
 
     Ok(DecodedImage { width, height, rgba, srgb })
 }

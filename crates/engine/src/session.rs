@@ -944,6 +944,8 @@ impl Session {
     }
 
     fn after_history(&mut self, other: &Document) {
+        // Pending operations may still hold layer IDs from the discarded snapshot
+        self.doc.project.next_id = self.doc.project.next_id.max(other.project.next_id);
         self.modified = true;
 
         // Layers picked together belong to the stack they were picked in
