@@ -794,14 +794,14 @@ fn hdf5_truncated_and_corrupted_files_never_panic() {
     for style in STYLES {
         let bytes = sample_file(style, true);
         for n in (0..bytes.len()).step_by(7) {
-            let _ = read(&bytes[..n]);
+            let _ = read_inner(&bytes[..n]);
         }
         // The root header is written last, so truncation alone stops early: punch holes too.
         for n in (0..bytes.len()).step_by(5) {
             let mut b = bytes.clone();
             let end = (n + 24).min(b.len());
             b[n..end].fill(0xff);
-            let _ = read(&b);
+            let _ = read_inner(&b);
         }
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         for i in 0..6000 {
@@ -814,7 +814,7 @@ fn hdf5_truncated_and_corrupted_files_never_panic() {
                 b[i] = (rng >> 32) as u8;
             }
             // Finishing (welding, unwrapping) is slow: run it on every 50th file that reads.
-            if let Ok(raw) = read(&b)
+            if let Ok(raw) = read_inner(&b)
                 && i % 50 == 0
             {
                 let _ = finish(raw);
@@ -856,12 +856,28 @@ fn hdf5_continuation_pointing_at_itself_is_bounded() {
     for style in STYLES {
         let mut w = W::new(style);
         let mut cont = PLACEHOLDER.to_le_bytes().to_vec();
-        cont.extend(64u64.to_le_bytes());
-        let msgs = vec![(5u16, vec![2, 2, 2, 0]), (0x10u16, cont)];
-        let at = w.header(&msgs);
+        cont.extend(0u64.to_le_bytes());
+        let mut order = 0u16;
+        let mut chunk = w.messages(&[(0x10u16, cont)], &mut order);
+        if style != Style::Classic {
+            let mut c = b"OCHK".to_vec();
+            c.extend(chunk);
+            c.extend([0; 4]);
+            chunk = c;
+        }
+        let chunk_len = chunk.len() as u64;
+        let chunk_at = w.put(&chunk);
+        let mut first_cont = chunk_at.to_le_bytes().to_vec();
+        first_cont.extend(chunk_len.to_le_bytes());
+        let at = w.header(&[(5u16, vec![2, 2, 2, 0]), (0x10u16, first_cont)]);
         let mut bytes = w.finish(at);
-        patch_placeholder(&mut bytes, at);
-        assert!(read(&bytes).is_err(), "{style:?}");
+        let pat = PLACEHOLDER.to_le_bytes();
+        let pos = bytes.windows(8).position(|s| s == pat).unwrap();
+        bytes[pos..pos + 8].copy_from_slice(&chunk_at.to_le_bytes());
+        bytes[pos + 8..pos + 16].copy_from_slice(&chunk_len.to_le_bytes());
+        let mut h = super::hdf5::H5::open(&bytes).unwrap();
+        let e = h.links(h.root).err().unwrap_or_else(|| panic!("{style:?} read a looping continuation")).to_string();
+        assert!(e.contains("continues in a loop"), "{style:?}: {e}");
     }
 }
 
@@ -895,15 +911,20 @@ fn hdf5_names_are_charged_against_the_decode_budget() {
         let attrs: Vec<Vec<u8>> = (0..12i32).map(|i| w.attribute(&format!("{long}{i:02}"), Ty::I32, None, &i.to_le_bytes())).collect();
         let group = w.group(&links, &attrs);
         let bytes = w.finish(group);
-        // 100 bytes left: twelve 62-byte names cannot fit, in either list.
-        let open = || {
+        let open = |left: usize| {
             let mut h = super::hdf5::H5::open(&bytes).unwrap();
-            h.charge(super::MAX_DECODED_BYTES - 100).unwrap();
+            h.charge(super::MAX_DECODED_BYTES - left).unwrap();
             h
         };
-        let e = open().links(group).err().unwrap_or_else(|| panic!("{style:?} read links past the budget")).to_string();
+        let link_entries = 12 * std::mem::size_of::<super::hdf5::Link>();
+        let attr_entries = 12 * std::mem::size_of::<super::hdf5::Attr>();
+        let name_bytes = 12 * 62;
+        assert_eq!(open(link_entries + name_bytes).links(group).unwrap().len(), 12, "{style:?}");
+        assert_eq!(open(attr_entries + name_bytes).attributes(group).unwrap().len(), 12, "{style:?}");
+        // Enough room for the entries alone, but not for the twelve 62-byte names as well.
+        let e = open(link_entries + 100).links(group).err().unwrap_or_else(|| panic!("{style:?} read links past the budget")).to_string();
         assert!(e.contains("more than"), "{style:?}: {e}");
-        let e = open().attributes(group).err().unwrap_or_else(|| panic!("{style:?} read attributes past the budget")).to_string();
+        let e = open(attr_entries + 100).attributes(group).err().unwrap_or_else(|| panic!("{style:?} read attributes past the budget")).to_string();
         assert!(e.contains("more than"), "{style:?}: {e}");
     }
 }
@@ -959,4 +980,124 @@ fn hdf5_many_links_and_attributes_keep_creation_order() {
             assert_eq!(super::hdf5::numbers(a.dtype, a.data).unwrap(), vec![i as f64], "{style:?}");
         }
     }
+}
+
+#[test]
+fn hdf5_contiguous_layout_checks_allocated_byte_size() {
+    let mut w = W::new(Style::Compact);
+    let raw = [1u8; 24];
+    let at = w.put(&raw);
+    // Dataspace requires 6 i32 elements (24 bytes), but version 3 contiguous layout allocates 12 bytes.
+    let mut l = vec![3, 1];
+    l.extend(at.to_le_bytes());
+    l.extend(12u64.to_le_bytes());
+    let ds = w.header(&[(1, w.dataspace(Some(&[6]))), (3, datatype(Ty::I32)), (8, l)]);
+    let bytes = w.finish(ds);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    let e = h.dataset(ds).err().unwrap().to_string();
+    assert!(e.contains("contiguous dataset holds less than its size"), "{e}");
+
+    // Legacy version 2 contiguous layout (no stored byte size) reads the 24-byte span.
+    let mut w2 = W::new(Style::Classic);
+    let at2 = w2.put(&raw);
+    let mut l2 = vec![2, 0, 1, 0, 0, 0, 0, 0];
+    l2.extend(at2.to_le_bytes());
+    let ds2 = w2.header(&[(1, w2.dataspace(Some(&[6]))), (3, datatype(Ty::I32)), (8, l2)]);
+    let bytes2 = w2.finish(ds2);
+    let mut h2 = super::hdf5::H5::open(&bytes2).unwrap();
+    assert_eq!(h2.dataset(ds2).unwrap().data.len(), 24);
+}
+
+#[test]
+fn hdf5_chunked_dataset_validates_grid_origins_and_descriptor_bounds() {
+    let build = |shape: &[u64], chunk_dims: &[u64], origins: &[Vec<u64>]| -> (Vec<u8>, u64) {
+        let mut w = W::new(Style::Compact);
+        let chunk_elems: u64 = chunk_dims.iter().product();
+        let chunk_raw = vec![1u8; chunk_elems as usize];
+        let chunk_at = w.put(&chunk_raw);
+        let mut tree = b"TREE".to_vec();
+        tree.extend([1, 0]);
+        tree.extend(u16le(origins.len()));
+        tree.extend(UNDEF.to_le_bytes());
+        tree.extend(UNDEF.to_le_bytes());
+        for off in origins {
+            tree.extend((chunk_raw.len() as u32).to_le_bytes());
+            tree.extend(0u32.to_le_bytes());
+            for o in off {
+                tree.extend(o.to_le_bytes());
+            }
+            tree.extend(0u64.to_le_bytes());
+            tree.extend(chunk_at.to_le_bytes());
+        }
+        tree.extend(0u32.to_le_bytes());
+        tree.extend(0u32.to_le_bytes());
+        for s in shape {
+            tree.extend(s.to_le_bytes());
+        }
+        tree.extend(0u64.to_le_bytes());
+        let tree_at = w.put(&tree);
+        let mut l = vec![3, 2, (chunk_dims.len() + 1) as u8];
+        l.extend(tree_at.to_le_bytes());
+        for d in chunk_dims {
+            l.extend((*d as u32).to_le_bytes());
+        }
+        l.extend(1u32.to_le_bytes());
+        let ds = w.header(&[(1, w.dataspace(Some(shape))), (3, datatype(Ty::U8)), (8, l)]);
+        (w.finish(ds), ds)
+    };
+
+    // Valid 5×5 dataset with 4×4 chunks covering all four grid cells.
+    let (bytes, ds) = build(&[5, 5], &[4, 4], &[vec![0, 0], vec![0, 4], vec![4, 0], vec![4, 4]]);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    assert_eq!(h.dataset(ds).unwrap().data.len(), 25);
+
+    // Missing grid cells (2 of 4 chunks on a 5×5 dataset with 4×4 chunks) must be rejected.
+    let (bytes, ds) = build(&[5, 5], &[4, 4], &[vec![0, 0], vec![0, 4]]);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    let e = h.dataset(ds).err().unwrap().to_string();
+    assert!(e.contains("unwritten chunks"), "{e}");
+
+    // Unaligned chunk origin (row 2 is not a multiple of 4) must be rejected.
+    let (bytes, ds) = build(&[5, 5], &[4, 4], &[vec![0, 0], vec![0, 4], vec![2, 0], vec![4, 4]]);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    let e = h.dataset(ds).err().unwrap().to_string();
+    assert!(e.contains("not aligned"), "{e}");
+
+    // Duplicate chunk origin must be rejected.
+    let (bytes, ds) = build(&[5, 5], &[4, 4], &[vec![0, 0], vec![0, 4], vec![4, 0], vec![4, 0]]);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    let e = h.dataset(ds).err().unwrap().to_string();
+    assert!(e.contains("duplicate chunks"), "{e}");
+
+    // More leaf descriptors than grid cells must be rejected before retaining extras.
+    let (bytes, ds) = build(&[5, 5], &[4, 4], &[vec![0, 0], vec![0, 4], vec![4, 0], vec![4, 4], vec![0, 0]]);
+    let mut h = super::hdf5::H5::open(&bytes).unwrap();
+    let e = h.dataset(ds).err().unwrap().to_string();
+    assert!(e.contains("more chunks than the dataset holds"), "{e}");
+}
+
+#[test]
+fn hdf5_attribute_text_copies_are_charged_against_the_decode_budget() {
+    let mut w = W::new(Style::Compact);
+    let long_meta = format!("schema=AbcGeom_Xform_v3;note={}", "m".repeat(200));
+    let child_attrs = vec![w.string_attribute(".prop.meta", &long_meta)];
+    let child = w.group(&[], &child_attrs);
+    let top_links: Vec<(String, u64)> = (0..20).map(|i| (format!("c{i:02}"), child)).collect();
+    let top = w.group(&top_links, &[]);
+    let root = w.group(&[("ABC".into(), top)], &[]);
+    let bytes = w.finish(root);
+
+    let mut archive = super::hdf5_archive::H5Archive::open(&bytes).unwrap();
+    let top_loc = archive.top().unwrap();
+    assert_eq!(archive.children(&top_loc).unwrap().len(), 20);
+
+    // Budget sufficient to open, read the 20 hard links and cache the single `.prop.meta`
+    // attribute, but not to allocate 20 owned copies of the 229-byte metadata string.
+    let mut tight = super::hdf5_archive::H5Archive::open(&bytes).unwrap();
+    let top_loc = tight.top().unwrap();
+    let link_cost = 20 * (3 + std::mem::size_of::<super::hdf5::Link>());
+    let attr_cost = ".prop.meta".len() + std::mem::size_of::<super::hdf5::Attr>();
+    tight.charge(super::MAX_DECODED_BYTES - link_cost - attr_cost - 500).unwrap();
+    let e = tight.children(&top_loc).err().unwrap_or_else(|| panic!("children() exceeded the decode budget")).to_string();
+    assert!(e.contains("more than"), "{e}");
 }

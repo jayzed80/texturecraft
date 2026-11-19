@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::hdf5::{Attr, H5, Link, numbers, text};
+use super::hdf5::{Attr, H5, Link, numbers};
 use super::{Archive, Prop, PropKind};
 use crate::{Result, malformed};
 
@@ -43,6 +43,11 @@ pub(super) struct H5Archive<'a> {
 impl<'a> H5Archive<'a> {
     pub(super) fn open(bytes: &'a [u8]) -> Result<H5Archive<'a>> {
         Ok(H5Archive { h: H5::open(bytes)?, links: HashMap::new(), attrs: HashMap::new(), is_group: HashMap::new() })
+    }
+
+    #[cfg(test)]
+    pub(super) fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.h.charge(bytes)
     }
 
     /// The top object: the root group's `ABC` group.
@@ -104,7 +109,10 @@ impl<'a> H5Archive<'a> {
             let Some(&word) = info.first() else { continue };
             let word = word as u32;
             let meta_name = format!("{name}.meta");
-            let meta = attrs.iter().find(|m| m.name == meta_name).map(text).unwrap_or_default();
+            let meta = match attrs.iter().find(|m| m.name == meta_name) {
+                Some(m) => self.h.text(m)?,
+                None => String::new(),
+            };
             let kind = match word & 0x03 {
                 0 => PropKind::Compound,
                 1 => PropKind::Scalar,
@@ -129,7 +137,10 @@ impl Archive for H5Archive<'_> {
                 continue;
             }
             let attrs = self.attrs(l.addr)?;
-            let meta = attrs.iter().find(|a| a.name == ".prop.meta").map(text).unwrap_or_default();
+            let meta = match attrs.iter().find(|a| a.name == ".prop.meta") {
+                Some(a) => self.h.text(a)?,
+                None => String::new(),
+            };
             out.push((l.name.clone(), meta, Loc { group: l.addr, name: String::new() }));
         }
         Ok(out)

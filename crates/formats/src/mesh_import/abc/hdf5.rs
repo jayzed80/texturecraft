@@ -159,10 +159,37 @@ impl Dtype {
             return Err(bad("a datatype of size 0"));
         }
         let b0 = bits.first().copied().unwrap_or(0);
+        let b1 = bits.get(1).copied().unwrap_or(0);
         Ok(match class_version & 0x0f {
-            0 => Dtype::Int { size, signed: b0 & 0x08 != 0, big_endian: b0 & 0x01 != 0 },
+            0 => {
+                let offset = r.u16()? as usize;
+                let prec = r.u16()? as usize;
+                let signed = b0 & 0x08 != 0;
+                let valid = [1usize, 2, 4, 8].contains(&size) && offset == 0 && b0 & 0x06 == 0 && (prec == 8 * size || (size == 1 && !signed && prec == 1));
+                if valid { Dtype::Int { size, signed, big_endian: b0 & 0x01 != 0 } } else { Dtype::Other { class: 0, size } }
+            }
             // Byte order is bits 0 and 6: 00 little-endian, 01 big-endian, 11 VAX.
-            1 if b0 & 0x40 == 0 => Dtype::Float { size, big_endian: b0 & 0x01 != 0 },
+            1 => {
+                let offset = r.u16()? as usize;
+                let prec = r.u16()? as usize;
+                let exp_loc = r.u8()? as usize;
+                let exp_size = r.u8()? as usize;
+                let mant_loc = r.u8()? as usize;
+                let mant_size = r.u8()? as usize;
+                let bias = r.u32()?;
+                let sign_loc = b1 as usize;
+                let ieee = match size {
+                    2 => (prec, exp_loc, exp_size, mant_loc, mant_size, bias, sign_loc) == (16, 10, 5, 0, 10, 15, 15),
+                    4 => (prec, exp_loc, exp_size, mant_loc, mant_size, bias, sign_loc) == (32, 23, 8, 0, 23, 127, 31),
+                    8 => (prec, exp_loc, exp_size, mant_loc, mant_size, bias, sign_loc) == (64, 52, 11, 0, 52, 1023, 63),
+                    _ => false,
+                };
+                if b0 & 0x40 == 0 && b0 & 0x0e == 0 && (b0 >> 4) & 0x03 == 2 && offset == 0 && ieee {
+                    Dtype::Float { size, big_endian: b0 & 0x01 != 0 }
+                } else {
+                    Dtype::Other { class: 1, size }
+                }
+            }
             3 => Dtype::Str { size },
             class => Dtype::Other { class, size },
         })
@@ -250,7 +277,10 @@ struct Heap {
 /// Data layout of a dataset.
 enum Layout<'a> {
     Compact(&'a [u8]),
-    Contiguous(Option<u64>),
+    Contiguous {
+        addr: Option<u64>,
+        size: Option<u64>,
+    },
     /// Chunk dimensions (rank + 1 entries, the last one the element size, may be absent) and
     /// the chunk index.
     Chunked {
@@ -922,8 +952,11 @@ impl<'a> H5<'a> {
         }
         let data = match self.layout(layout.data)? {
             Layout::Compact(raw) => Cow::Borrowed(raw.get(..bytes).ok_or_else(|| bad("a compact dataset holds less than its size"))?),
-            Layout::Contiguous(at) => {
-                let at = at.ok_or_else(|| unsupported("datasets without stored data"))?;
+            Layout::Contiguous { addr, size } => {
+                let at = addr.ok_or_else(|| unsupported("datasets without stored data"))?;
+                if size.is_some_and(|s| s < bytes as u64) {
+                    return Err(bad("a contiguous dataset holds less than its size"));
+                }
                 Cow::Borrowed(self.at(at, bytes as u64)?)
             }
             Layout::Chunked { dims, index } => {
@@ -952,7 +985,7 @@ impl<'a> H5<'a> {
                         let n = r.usize(4)?;
                         Ok(Layout::Compact(r.take(n)?))
                     }
-                    1 => Ok(Layout::Contiguous(at)),
+                    1 => Ok(Layout::Contiguous { addr: at, size: None }),
                     2 => Ok(Layout::Chunked { dims, index: ChunkIndex::BTree(at) }),
                     c => Err(unsupported(format!("layout class {c}"))),
                 }
@@ -962,7 +995,7 @@ impl<'a> H5<'a> {
                     let n = r.u16()? as usize;
                     Ok(Layout::Compact(r.take(n)?))
                 }
-                1 => Ok(Layout::Contiguous(self.addr(&mut r)?)),
+                1 => Ok(Layout::Contiguous { addr: self.addr(&mut r)?, size: Some(self.len(&mut r)?) }),
                 2 if version == 3 => {
                     let rank = r.u8()? as usize;
                     if rank > MAX_RANK + 1 {
@@ -1005,21 +1038,46 @@ impl<'a> H5<'a> {
             .and_then(|n| usize::try_from(n).ok())
             .filter(|n| *n <= MAX_DECODED_BYTES)
             .ok_or_else(|| FormatError::TooLarge("a dataset chunk is too large".into()))?;
+        let grid = shape
+            .iter()
+            .zip(chunk)
+            .try_fold(1u64, |n, (s, c)| n.checked_mul(s.div_ceil(*c)))
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n <= MAX_STEPS)
+            .ok_or_else(|| FormatError::TooLarge("a chunked dataset has too many chunks".into()))?;
         let mut chunks = Vec::new();
         match index {
-            ChunkIndex::BTree(Some(tree)) => self.chunk_node(tree, None, 0, rank, &mut chunks)?,
+            ChunkIndex::BTree(Some(tree)) => self.chunk_node(tree, None, 0, rank, grid, &mut chunks)?,
             ChunkIndex::BTree(None) => {}
             ChunkIndex::Single { addr, size: stored, mask } => {
                 if let Some(addr) = addr {
-                    chunks.push(ChunkRef { offsets: vec![0; rank], addr, size: stored.unwrap_or(chunk_bytes as u64), mask });
+                    let offsets = vec![0; rank];
+                    self.charge(std::mem::size_of::<ChunkRef>().saturating_add(rank.saturating_mul(8)))?;
+                    chunks.push(ChunkRef { offsets, addr, size: stored.unwrap_or(chunk_bytes as u64), mask });
                 }
             }
         }
-        // Alembic writes every chunk: refusing gaps also keeps a damaged size from allocating
-        // much more than the chunks hold.
-        if (chunks.len() as u64).checked_mul(chunk_bytes as u64).is_none_or(|n| n < bytes as u64) {
+        // Alembic writes every chunk on the chunk grid: requiring exact origin coverage also
+        // keeps a damaged size or duplicate origin from returning unwritten or overwritten rows.
+        let (mut k, mut origins) = (0usize, HashSet::with_capacity(chunks.len()));
+        for c in &chunks {
+            self.step()?;
+            let mut key = 0u64;
+            for ((o, s), d) in c.offsets.iter().zip(shape).zip(chunk) {
+                if *o >= *s || *o % *d != 0 {
+                    return Err(bad("a chunk is not aligned to the dataset's chunk grid"));
+                }
+                key = key * s.div_ceil(*d) + *o / *d;
+            }
+            if c.offsets.len() != rank || !origins.insert(key) {
+                return Err(bad("a chunked dataset has duplicate chunks"));
+            }
+            k += 1;
+        }
+        if k != grid {
             return Err(unsupported("chunked datasets with unwritten chunks"));
         }
+        drop(origins);
         // Allocated once a chunk has decoded to its full size.
         let mut out = None;
         for c in chunks {
@@ -1035,7 +1093,7 @@ impl<'a> H5<'a> {
 
     /// Chunks of a version 1 B-tree node of type 1: keys of stored size (4), filter mask (4) and
     /// rank + 1 element offsets (8 each), around child addresses.
-    fn chunk_node(&mut self, addr: u64, level: Option<u8>, depth: usize, rank: usize, out: &mut Vec<ChunkRef>) -> Result<()> {
+    fn chunk_node(&mut self, addr: u64, level: Option<u8>, depth: usize, rank: usize, max_chunks: usize, out: &mut Vec<ChunkRef>) -> Result<()> {
         self.step()?;
         if depth > MAX_TREE_DEPTH {
             return Err(bad("a chunk B-tree is nested too deeply"));
@@ -1053,16 +1111,32 @@ impl<'a> H5<'a> {
         for _ in 0..entries {
             let size = r.u32()? as u64;
             let mask = r.u32()?;
-            let offsets = (0..rank).map(|_| r.uint(8)).collect::<Result<Vec<u64>>>()?;
-            r.skip(8)?;
-            let child = self.addr(&mut r)?.ok_or_else(|| bad("a chunk at the undefined address"))?;
             if node_level == 0 {
+                if out.len() >= max_chunks {
+                    return Err(bad("a chunk B-tree lists more chunks than the dataset holds"));
+                }
+                self.charge(std::mem::size_of::<ChunkRef>().saturating_add(rank.saturating_mul(8)))?;
+                let offsets = (0..rank).map(|_| r.uint(8)).collect::<Result<Vec<u64>>>()?;
+                r.skip(8)?;
+                let child = self.addr(&mut r)?.ok_or_else(|| bad("a chunk at the undefined address"))?;
                 out.push(ChunkRef { offsets, addr: child, size, mask });
             } else {
-                self.chunk_node(child, Some(node_level - 1), depth + 1, rank, out)?;
+                r.skip(rank.saturating_add(1).saturating_mul(8))?;
+                let child = self.addr(&mut r)?.ok_or_else(|| bad("a chunk at the undefined address"))?;
+                self.chunk_node(child, Some(node_level - 1), depth + 1, rank, max_chunks, out)?;
             }
         }
         Ok(())
+    }
+
+    /// A string attribute's text (fixed-length string or 8-bit characters), up to the first NUL.
+    pub(super) fn text(&mut self, attr: &Attr) -> Result<String> {
+        let bytes = match attr.dtype {
+            Dtype::Str { .. } | Dtype::Int { size: 1, .. } => attr.data.split(|c| *c == 0).next().unwrap_or_default(),
+            _ => return Ok(String::new()),
+        };
+        self.charge(bytes.len())?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -1112,16 +1186,21 @@ fn filter_ids(data: &[u8]) -> Result<Vec<u16>> {
 
 /// Undoes the filters of a chunk (last applied first), skipping those `mask` marks.
 fn unfilter(raw: &[u8], mask: u32, filters: &[u16], size: usize, expect: usize) -> Result<Vec<u8>> {
+    let active = |i: usize| i >= 32 || mask & (1 << i) == 0;
     let mut data = raw.to_vec();
     for (i, id) in filters.iter().enumerate().rev() {
-        if i < 32 && mask & (1 << i) != 0 {
+        if !active(i) {
             continue;
         }
         data = match id {
             1 => {
+                // Fletcher-32 filters that ran before this deflate each added a 4-byte checksum
+                // that has not been stripped yet.
+                let extra = filters[..i].iter().enumerate().filter(|(j, f)| active(*j) && **f == 3).count().saturating_mul(4);
+                let limit = (expect as u64).checked_add(extra as u64).and_then(|n| n.checked_add(1)).ok_or_else(|| bad("chunk size overflow"))?;
                 let mut out = Vec::new();
                 flate2::read::ZlibDecoder::new(data.as_slice())
-                    .take(expect as u64 + 1)
+                    .take(limit)
                     .read_to_end(&mut out)
                     .map_err(|e| bad(format!("a compressed chunk does not inflate: {e}")))?;
                 out
@@ -1222,14 +1301,6 @@ pub(super) fn numbers(dtype: Dtype, data: &[u8]) -> Result<Vec<f64>> {
     }
 }
 
-/// A string attribute's text (fixed-length string or 8-bit characters), up to the first NUL.
-pub(super) fn text(attr: &Attr) -> String {
-    match attr.dtype {
-        Dtype::Str { .. } | Dtype::Int { size: 1, .. } => String::from_utf8_lossy(attr.data.split(|c| *c == 0).next().unwrap_or_default()).into_owned(),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1286,5 +1357,42 @@ mod tests {
         let mut c = vec![0u8; 1000];
         c[700..708].copy_from_slice(SIGNATURE);
         assert_eq!(superblock_at(&c), None);
+    }
+
+    #[test]
+    fn datatypes_validate_representation_fields() {
+        // One-bit zero-padded unsigned Boolean (used by Alembic) is accepted.
+        let bool1 = [0x10, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0];
+        assert_eq!(Dtype::parse(&bool1).unwrap(), Dtype::Int { size: 1, signed: false, big_endian: false });
+        // A two-byte unsigned integer with bit offset 4 is rejected as an unsupported representation.
+        let shifted = [0x10, 0, 0, 0, 2, 0, 0, 0, 4, 0, 16, 0];
+        assert_eq!(Dtype::parse(&shifted).unwrap(), Dtype::Other { class: 0, size: 2 });
+        assert!(numbers(Dtype::parse(&shifted).unwrap(), &[0x10, 0x00]).is_err());
+        // IEEE f16, f32 and f64 are accepted; a 4-byte float with non-IEEE exponent bias is rejected.
+        let f16_dt = [0x11, 0x20, 15, 0, 2, 0, 0, 0, 0, 0, 16, 0, 10, 5, 0, 10, 15, 0, 0, 0];
+        assert_eq!(Dtype::parse(&f16_dt).unwrap(), Dtype::Float { size: 2, big_endian: false });
+        let bad_f32 = [0x11, 0x20, 31, 0, 4, 0, 0, 0, 0, 0, 32, 0, 23, 8, 0, 23, 128, 0, 0, 0];
+        assert_eq!(Dtype::parse(&bad_f32).unwrap(), Dtype::Other { class: 1, size: 4 });
+        assert!(numbers(Dtype::parse(&bad_f32).unwrap(), &1.0f32.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn fletcher32_and_deflate_work_in_both_orders() {
+        use std::io::Write as _;
+        let plain: Vec<u8> = (0u8..16).collect();
+        let deflate = |b: &[u8]| {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(b).unwrap();
+            z.finish().unwrap()
+        };
+        // Fletcher-32 applied before deflate: inflate produces 20 bytes before the 4-byte checksum is stripped.
+        let mut with_crc = plain.clone();
+        with_crc.extend([0xde, 0xad, 0xbe, 0xef]);
+        let fletcher_then_deflate = deflate(&with_crc);
+        assert_eq!(unfilter(&fletcher_then_deflate, 0, &[3, 1], 4, 16).unwrap(), plain);
+        // Deflate applied before Fletcher-32: 4-byte checksum is stripped before inflating to 16 bytes.
+        let mut deflate_then_fletcher = deflate(&plain);
+        deflate_then_fletcher.extend([0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(unfilter(&deflate_then_fletcher, 0, &[1, 3], 4, 16).unwrap(), plain);
     }
 }
