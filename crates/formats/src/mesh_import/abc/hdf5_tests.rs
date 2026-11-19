@@ -759,15 +759,22 @@ fn hdf5_triangle_imports_through_the_public_entry_point() {
 
 #[test]
 fn hdf5_superblock_after_a_user_block_is_found() {
-    // A 512-byte user block before the HDF5 data: addresses are relative to the base address.
+    // A 512-byte user block before the HDF5 data: addresses are relative to the base address,
+    // the superblock's own offset. It must work whether the writer updated the stored base
+    // address field or left it at the value it wrote for a file without a user block.
     for style in [Style::Classic, Style::Compact] {
         let bytes = sample_file(style, true);
-        let mut shifted = vec![b'u'; 512];
-        shifted.extend_from_slice(&bytes);
-        // The base address field (after the version 0 or version 2 superblock's fixed fields).
-        let base = if style == Style::Classic { 24 } else { 12 };
-        shifted[512 + base..512 + base + 8].copy_from_slice(&512u64.to_le_bytes());
-        assert_eq!(summary(read(&shifted).unwrap()), summary(read(&bytes).unwrap()), "{style:?}");
+        let expected = summary(read(&bytes).unwrap());
+        for stored_base in [None, Some(512u64)] {
+            let mut shifted = vec![b'u'; 512];
+            shifted.extend_from_slice(&bytes);
+            if let Some(base) = stored_base {
+                // The base address field (after the version 0 or version 2 superblock's fixed fields).
+                let field = if style == Style::Classic { 24 } else { 12 };
+                shifted[512 + field..512 + field + 8].copy_from_slice(&base.to_le_bytes());
+            }
+            assert_eq!(summary(read(&shifted).unwrap()), expected, "{style:?} stored base {stored_base:?}");
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 //! structures):
 //!
 //! - superblock versions 0 to 3 (found at offset 0, 512, 1024, ...; addresses are relative to
-//!   the base address);
+//!   the base address, the superblock's own offset);
 //! - object headers version 1 and version 2 (`OHDR`), with continuation blocks (`OCHK`);
 //! - groups stored as symbol tables (version 1 B-tree of type 0, symbol table nodes, local
 //!   heap), as link messages, or densely (link info message: fractal heap and version 2 B-tree
@@ -284,7 +284,11 @@ impl<'a> H5<'a> {
         let mut r = Rd::new(b.get(at..).unwrap_or_default());
         r.skip(SIGNATURE.len())?;
         let version = r.u8()?;
-        let mut h = H5 { b, base: 0, so: 8, sl: 8, root: 0, steps: 0, budget: MAX_DECODED_BYTES };
+        // File addresses are relative to the base address, which the specification defines as
+        // the superblock's own file address: a user block moves both. Take it from where the
+        // signature was found, so a file whose stored field is stale still reads.
+        let base = u64::try_from(at).map_err(|_| bad("a superblock offset out of range"))?;
+        let mut h = H5 { b, base, so: 8, sl: 8, root: 0, steps: 0, budget: MAX_DECODED_BYTES };
         let check = |so: usize, sl: usize| {
             if [2, 4, 8].contains(&so) && [2, 4, 8].contains(&sl) { Ok(()) } else { Err(unsupported(format!("{so}-byte offsets and {sl}-byte lengths"))) }
         };
@@ -298,7 +302,8 @@ impl<'a> H5<'a> {
                 if version == 1 {
                     r.skip(4)?;
                 }
-                h.base = r.uint(so)?;
+                // The stored base address, which must be the position used above.
+                r.skip(so)?;
                 r.skip(3 * so)?;
                 // Root group symbol table entry: link name offset, object header address.
                 r.skip(so)?;
@@ -309,7 +314,8 @@ impl<'a> H5<'a> {
                 check(so, sl)?;
                 (h.so, h.sl) = (so, sl);
                 r.skip(1)?;
-                h.base = r.uint(so)?;
+                // The stored base address, which must be the position used above.
+                r.skip(so)?;
                 r.skip(2 * so)?;
                 h.root = h.addr(&mut r)?.ok_or_else(|| bad("the root group has no address"))?;
             }
